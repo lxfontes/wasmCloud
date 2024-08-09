@@ -1,0 +1,11 @@
+name = "HTTP Server"
+language = "rust"
+version = "0.22.0"
+type = "provider"
+
+[rust]
+target_dir = "../../"
+
+[provider]
+bin_name = "http-shared-server-provider"
+vendor = "wasmCloud"

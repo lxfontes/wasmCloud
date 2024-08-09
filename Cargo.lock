@@ -7137,6 +7137,7 @@ dependencies = [
  "wasmcloud-provider-blobstore-s3",
  "wasmcloud-provider-http-client",
  "wasmcloud-provider-http-server",
+ "wasmcloud-provider-http-shared-server",
  "wasmcloud-provider-keyvalue-nats",
  "wasmcloud-provider-keyvalue-redis",
  "wasmcloud-provider-keyvalue-vault",
@@ -7440,6 +7441,30 @@ dependencies = [
 
 [[package]]
 name = "wasmcloud-provider-http-server"
+version = "0.22.0"
+dependencies = [
+ "anyhow",
+ "async-nats-wrpc",
+ "axum 0.7.5",
+ "axum-server",
+ "base64 0.22.1",
+ "bytes",
+ "dashmap",
+ "futures",
+ "http 1.1.0",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "toml 0.8.15",
+ "tower-http",
+ "tracing",
+ "wasmcloud-provider-sdk",
+ "wrpc-interface-http",
+]
+
+[[package]]
+name = "wasmcloud-provider-http-shared-server"
 version = "0.22.0"
 dependencies = [
  "anyhow",
