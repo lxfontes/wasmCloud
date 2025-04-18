@@ -233,7 +233,6 @@ impl ControlInterfaceServer for Host {
         self.heartbeat.abort();
         self.data_watch.abort();
         self.queue.abort();
-        self.policy_manager.policy_changes.abort();
         let deadline =
             timeout.and_then(|timeout| Instant::now().checked_add(Duration::from_millis(timeout)));
         self.stop_tx.send_replace(deadline);
@@ -653,26 +652,12 @@ impl ControlInterfaceServer for Host {
     #[instrument(level = "trace", skip(self))]
     async fn handle_config_get(&self, config_name: &str) -> anyhow::Result<Vec<u8>> {
         trace!(%config_name, "handling get config");
-        if let Some(config_bytes) = self.config_data.get(config_name).await? {
-            let config_map: HashMap<String, String> = serde_json::from_slice(&config_bytes)
-                .context("config data should be a map of string -> string")?;
-            serde_json::to_vec(&CtlResponse::ok(config_map)).map_err(anyhow::Error::from)
-        } else {
-            serde_json::to_vec(&CtlResponse::<()>::success(
-                "Configuration not found".into(),
-            ))
-            .map_err(anyhow::Error::from)
-        }
+        todo!()
     }
 
     #[instrument(level = "debug", skip_all, fields(%config_name))]
     async fn handle_config_delete(&self, config_name: &str) -> anyhow::Result<CtlResponse<()>> {
         debug!("handle config entry deletion");
-
-        self.config_data
-            .purge(config_name)
-            .await
-            .context("Unable to delete config data")?;
 
         self.publish_event("config_deleted", event::config_deleted(config_name))
             .await?;
@@ -960,10 +945,6 @@ impl ControlInterfaceServer for Host {
         // Validate that the data is of the proper type by deserialing it
         serde_json::from_slice::<HashMap<String, String>>(&data)
             .context("config data should be a map of string -> string")?;
-        self.config_data
-            .put(config_name, data)
-            .await
-            .context("unable to store config data")?;
         // We don't write it into the cached data and instead let the caching thread handle it as we
         // won't need it immediately.
         self.publish_event("config_set", event::config_set(config_name))

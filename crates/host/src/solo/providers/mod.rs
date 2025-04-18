@@ -187,7 +187,7 @@ impl Host {
             config: host_config,
             secrets,
             provider_xkey_private_key,
-            host_xkey_public_key: self.secrets_xkey.public_key(),
+            host_xkey_public_key: self.host_key.public_key(),
             cluster_issuers: vec![],
             default_rpc_timeout_ms,
             log_level: Some(self.host_config.log_level.clone()),

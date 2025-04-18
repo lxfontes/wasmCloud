@@ -87,11 +87,11 @@ const MAX_INVOCATION_CHANNEL_SIZE: usize = 5000;
 const MIN_INVOCATION_CHANNEL_SIZE: usize = 256;
 
 #[derive(Debug)]
-struct Queue {
+struct ControlMapper {
     all_streams: SelectAll<async_nats::Subscriber>,
 }
 
-impl Stream for Queue {
+impl Stream for ControlMapper {
     type Item = async_nats::Message;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -140,7 +140,7 @@ impl TryFrom<AsyncBytesMut> for Vec<u8> {
     }
 }
 
-impl Queue {
+impl ControlMapper {
     #[instrument]
     async fn new(
         nats: &async_nats::Client,
@@ -236,7 +236,6 @@ struct WrpcServer {
     id: Arc<str>,
     image_reference: Arc<str>,
     annotations: Arc<Annotations>,
-    policy_manager: Arc<PolicyManager>,
     metrics: Arc<HostMetrics>,
 }
 
@@ -285,7 +284,6 @@ impl wrpc_transport::Serve for WrpcServer {
         let id = Arc::clone(&self.id);
         let image_reference = Arc::clone(&self.image_reference);
         let metrics = Arc::clone(&self.metrics);
-        let policy_manager = Arc::clone(&self.policy_manager);
         let claims = self.claims.clone();
         Ok(invocations.and_then(move |(cx, tx, rx)| {
             let annotations = Arc::clone(&annotations);
@@ -295,7 +293,6 @@ impl wrpc_transport::Serve for WrpcServer {
             let image_reference = Arc::clone(&image_reference);
             let instance = Arc::clone(&instance);
             let metrics = Arc::clone(&metrics);
-            let policy_manager = Arc::clone(&policy_manager);
             let span = tracing::info_span!("component_invocation", func = %func, id = %id, instance = %instance);
             async move {
                 if let Some(ref cx) = cx {
@@ -312,26 +309,6 @@ impl wrpc_transport::Serve for WrpcServer {
                         .collect::<Vec<(String, String)>>();
                     span.set_parent(wasmcloud_tracing::context::get_span_context(&trace_context));
                 }
-
-                let PolicyResponse {
-                    request_id,
-                    permitted,
-                    message,
-                } = policy_manager
-                    .evaluate_perform_invocation(
-                        &id,
-                        &image_reference,
-                        &annotations,
-                        claims.as_deref(),
-                        instance.to_string(),
-                        func.to_string(),
-                    )
-                    .instrument(debug_span!(parent: &span, "policy_check"))
-                    .await?;
-                ensure!(
-                    permitted,
-                    "policy denied request to invoke component `{request_id}`: `{message:?}`",
-                );
 
                 Ok((
                     InvocationContext{
@@ -362,8 +339,6 @@ pub struct Host {
     host_config: HostConfig,
     host_key: Arc<KeyPair>,
     host_token: Arc<jwt::Token<jwt::Host>>,
-    /// The Xkey used to encrypt secrets when sending them over NATS
-    secrets_xkey: Arc<XKey>,
     labels: Arc<RwLock<BTreeMap<String, String>>>,
     ctl_topic_prefix: String,
     /// NATS client to use for control interface subscriptions and jetstream queries
@@ -373,10 +348,6 @@ pub struct Host {
     data: Store,
     /// Task to watch for changes in the LATTICEDATA store
     data_watch: AbortHandle,
-    config_data: Store,
-    config_generator: BundleGenerator,
-    policy_manager: Arc<PolicyManager>,
-    secrets_manager: Arc<SecretsManager>,
     /// The provider map is a map of provider component ID to provider
     providers: RwLock<HashMap<String, Provider>>,
     registry_config: RwLock<HashMap<String, RegistryConfig>>,
@@ -629,7 +600,7 @@ async fn merge_registry_config(
 }
 
 impl Host {
-    const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+    const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
     const NAME_ADJECTIVES: &'static str = "
     autumn hidden bitter misty silent empty dry dark summer
@@ -712,7 +683,7 @@ impl Host {
             None
         };
 
-        let ((ctl_nats, queue), rpc_nats) = try_join!(
+        let ((ctl_nats, mapper), rpc_nats) = try_join!(
             async {
                 debug!(
                     ctl_nats_url = config.ctl_nats_url.as_str(),
@@ -728,7 +699,7 @@ impl Host {
                 )
                 .await
                 .context("failed to establish NATS control server connection")?;
-                let queue = Queue::new(
+                let mapper = ControlMapper::new(
                     &ctl_nats,
                     &config.ctl_topic_prefix,
                     &config.lattice,
@@ -739,7 +710,7 @@ impl Host {
                 .await
                 .context("failed to initialize queue")?;
                 ctl_nats.flush().await.context("failed to flush")?;
-                Ok((ctl_nats, queue))
+                Ok((ctl_nats, mapper))
             },
             async {
                 debug!(
@@ -790,9 +761,6 @@ impl Host {
         let bucket = format!("LATTICEDATA_{}", config.lattice);
         let data = create_bucket(&ctl_jetstream, &bucket).await?;
 
-        let config_bucket = format!("CONFIGDATA_{}", config.lattice);
-        let config_data = create_bucket(&ctl_jetstream, &config_bucket).await?;
-
         let (queue_abort, queue_abort_reg) = AbortHandle::new_pair();
         let (heartbeat_abort, heartbeat_abort_reg) = AbortHandle::new_pair();
         let (data_watch_abort, data_watch_abort_reg) = AbortHandle::new_pair();
@@ -806,19 +774,6 @@ impl Host {
         let registry_config = RwLock::new(supplemental_config.registry_config.unwrap_or_default());
         merge_registry_config(&registry_config, config.oci_opts.clone()).await;
 
-        let policy_manager = PolicyManager::new(
-            ctl_nats.clone(),
-            PolicyHostInfo {
-                public_key: host_key.public_key(),
-                lattice: config.lattice.to_string(),
-                labels: HashMap::from_iter(labels.clone()),
-            },
-            config.policy_service_config.policy_topic.clone(),
-            config.policy_service_config.policy_timeout_ms,
-            config.policy_service_config.policy_changes_topic.clone(),
-        )
-        .await?;
-
         // If provided, secrets topic must be non-empty
         // TODO(#2411): Validate secrets topic prefix as a valid NATS subject
         ensure!(
@@ -829,12 +784,6 @@ impl Host {
                     .is_some_and(|topic| !topic.is_empty()),
             "secrets topic prefix must be non-empty"
         );
-
-        let secrets_manager = Arc::new(SecretsManager::new(
-            &config_data,
-            config.secrets_topic_prefix.as_ref(),
-            &ctl_nats,
-        ));
 
         let scope = InstrumentationScope::builder("wasmcloud-host")
             .with_version(config.version.clone())
@@ -861,8 +810,6 @@ impl Host {
             None,
         )
         .context("failed to create HostMetrics instance")?;
-
-        let config_generator = BundleGenerator::new(config_data.clone());
 
         let max_execution_time_ms = config.max_execution_time;
 
@@ -950,7 +897,6 @@ impl Host {
             ctl_topic_prefix: config.ctl_topic_prefix.clone(),
             host_key,
             host_token,
-            secrets_xkey: Arc::new(XKey::new()),
             labels: Arc::new(RwLock::new(labels)),
             ctl_nats,
             rpc_nats: Arc::new(rpc_nats),
@@ -958,10 +904,6 @@ impl Host {
             host_config: config,
             data: data.clone(),
             data_watch: data_watch_abort.clone(),
-            config_data: config_data.clone(),
-            config_generator,
-            policy_manager,
-            secrets_manager,
             providers: RwLock::default(),
             registry_config,
             runtime,
@@ -983,7 +925,7 @@ impl Host {
         let queue = spawn({
             let host = Arc::clone(&host);
             async move {
-                let mut queue = Abortable::new(queue, queue_abort_reg);
+                let mut queue = Abortable::new(mapper, queue_abort_reg);
                 queue
                     .by_ref()
                     .for_each_concurrent(None, {
@@ -1110,7 +1052,6 @@ impl Host {
             heartbeat_abort.abort();
             queue_abort.abort();
             data_watch_abort.abort();
-            host.policy_manager.policy_changes.abort();
             let _ = try_join!(queue, data_watch, heartbeat).context("failed to await tasks")?;
             host.publish_event(
                 "host_stopped",
@@ -1301,7 +1242,6 @@ impl Host {
                     id: Arc::clone(&id),
                     image_reference: Arc::clone(&image_reference),
                     annotations: Arc::new(annotations.clone()),
-                    policy_manager: Arc::clone(&self.policy_manager),
                     metrics: Arc::clone(&self.metrics),
                 },
                 handler.clone(),
@@ -1601,29 +1541,6 @@ impl Host {
         trace!(?component_ref, max_instances, "scale component task");
 
         let claims = claims_token.map(|c| c.claims.clone());
-        match self
-            .policy_manager
-            .evaluate_start_component(
-                &component_id,
-                &component_ref,
-                max_instances,
-                annotations,
-                claims.as_ref(),
-            )
-            .await?
-        {
-            PolicyResponse {
-                permitted: false,
-                message: Some(message),
-                ..
-            } => bail!("Policy denied request to scale component `{component_id}`: `{message:?}`"),
-            PolicyResponse {
-                permitted: false, ..
-            } => bail!("Policy denied request to scale component `{component_id}`"),
-            PolicyResponse {
-                permitted: true, ..
-            } => (),
-        };
 
         let scaled_event = match (
             self.components
@@ -1925,24 +1842,6 @@ impl Host {
         }
 
         let annotations: Annotations = annotations.into_iter().collect();
-
-        let PolicyResponse {
-            permitted,
-            request_id,
-            message,
-        } = self
-            .policy_manager
-            .evaluate_start_provider(
-                provider_id,
-                provider_ref.as_ref(),
-                &annotations,
-                claims.as_ref(),
-            )
-            .await?;
-        ensure!(
-            permitted,
-            "policy denied request to start provider `{request_id}`: `{message:?}`",
-        );
 
         let component_specification = self
             .get_component_spec(provider_id)
@@ -2474,24 +2373,12 @@ impl Host {
         entity_jwt: Option<&String>,
         application: Option<&String>,
     ) -> anyhow::Result<(ConfigBundle, HashMap<String, SecretBox<SecretValue>>)> {
-        let (secret_names, config_names) = config_names
-            .iter()
-            .map(|s| s.to_string())
-            .partition(|name| name.starts_with(SECRET_PREFIX));
+        // let (secret_names, config_names) = config_names
+        //     .iter()
+        //     .map(|s| s.to_string())
+        //     .partition(|name| name.starts_with(SECRET_PREFIX));
 
-        let config = self
-            .config_generator
-            .generate(config_names)
-            .await
-            .context("Unable to fetch requested config")?;
-
-        let secrets = self
-            .secrets_manager
-            .fetch_secrets(secret_names, entity_jwt, &self.host_token.jwt, application)
-            .await
-            .context("Unable to fetch requested secrets")?;
-
-        Ok((config, secrets))
+        todo!()
     }
 
     /// Validates that the provided configuration names exist in the store and are valid.
@@ -2502,38 +2389,6 @@ impl Host {
     where
         I: IntoIterator<Item: AsRef<str>>,
     {
-        let config_store = self.config_data.clone();
-        let validation_errors =
-            futures::future::join_all(config_names.into_iter().map(|config_name| {
-                let config_store = config_store.clone();
-                let config_name = config_name.as_ref().to_string();
-                async move {
-                    match config_store.get(&config_name).await {
-                        Ok(Some(_)) => None,
-                        Ok(None) if config_name.starts_with(SECRET_PREFIX) => Some(format!(
-                            "Secret reference {config_name} not found in config store"
-                        )),
-                        Ok(None) => Some(format!(
-                            "Configuration {config_name} not found in config store"
-                        )),
-                        Err(e) => Some(e.to_string()),
-                    }
-                }
-            }))
-            .await;
-
-        // NOTE(brooksmtownsend): Not using `join` here because it requires a `String` and we
-        // need to flatten out the `None` values.
-        let validation_errors = validation_errors
-            .into_iter()
-            .flatten()
-            .fold(String::new(), |acc, e| acc + &e + ". ");
-        if !validation_errors.is_empty() {
-            bail!(format!(
-                "Failed to validate configuration and secrets. {validation_errors}",
-            ));
-        }
-
         Ok(())
     }
 
@@ -2589,24 +2444,9 @@ impl Host {
         // Serializing & sealing an empty map results in a non-empty Vec, which is difficult to tell the
         // difference between an empty map and an encrypted empty map. To avoid this, we explicitly handle
         // the case where the map is empty.
-        let source_secrets = if source_secrets_map.is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::to_vec(&source_secrets_map)
-                    .map(|secrets| self.secrets_xkey.seal(&secrets, provider_xkey))
-                    .context("failed to serialize and encrypt source secrets")??,
-            )
-        };
-        let target_secrets = if target_secrets_map.is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::to_vec(&target_secrets_map)
-                    .map(|secrets| self.secrets_xkey.seal(&secrets, provider_xkey))
-                    .context("failed to serialize and encrypt target secrets")??,
-            )
-        };
+        // NOTE(lxf): refactor
+        let source_secrets = None;
+        let target_secrets = None;
 
         Ok(wasmcloud_core::InterfaceLinkDefinition {
             source_id: link.source_id().to_string(),

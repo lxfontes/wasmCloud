@@ -86,6 +86,9 @@ impl crate::solo::Host {
             &host_id,
         )
         .await?;
+
+        // TODO(lxf): refactor
+        let server_xkey = Arc::new(XKey::new());
         let conn = ProviderConnection::new(
             Arc::clone(&self.rpc_nats),
             Arc::from(provider_id),
@@ -93,7 +96,7 @@ impl crate::solo::Host {
             host_id.to_string(),
             host_data.config,
             provider_xkey,
-            Arc::clone(&self.secrets_xkey),
+            server_xkey,
         )
         .context("failed to establish provider connection")?;
 
