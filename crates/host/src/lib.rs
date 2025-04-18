@@ -36,6 +36,8 @@ pub use secrets::Manager as SecretsManager;
 pub use wasmbus::{Host as WasmbusHost, HostConfig as WasmbusHostConfig};
 pub use wasmcloud_core::{OciFetcher, RegistryAuth, RegistryConfig, RegistryType};
 
+pub use solo::{Host as SoloHost, HostConfig as SoloHostConfig};
+
 pub use url;
 
 use std::collections::HashMap;

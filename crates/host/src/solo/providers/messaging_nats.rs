@@ -123,7 +123,7 @@ async fn handle_message(
                 span: Span::current(),
                 start_at: Instant::now(),
                 attributes: vec![
-                    KeyValue::new("component.ref", Arc::clone(&component.image_reference)),
+                    KeyValue::new("component.ref", component.image.to_string()),
                     KeyValue::new("lattice", lattice_id),
                     KeyValue::new("host", host_id),
                 ],

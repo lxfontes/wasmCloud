@@ -109,7 +109,7 @@ impl Default for Host {
             ctl_jwt: None,
             ctl_key: None,
             ctl_tls: false,
-            ctl_topic_prefix: "wasmbus.ctl".to_string(),
+            ctl_topic_prefix: "solo.ctl".to_string(),
             rpc_nats_url: Url::parse("nats://localhost:4222")
                 .expect("failed to parse RPC NATS URL"),
             rpc_timeout: Duration::from_millis(2000),

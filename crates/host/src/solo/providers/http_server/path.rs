@@ -218,7 +218,7 @@ impl Provider {
                                 attributes: vec![
                                     KeyValue::new(
                                         "component.ref",
-                                        Arc::clone(&component.image_reference),
+                                        component.image.to_string(),
                                     ),
                                     KeyValue::new("lattice", Arc::clone(&lattice_id)),
                                     KeyValue::new("host", Arc::clone(&host_id)),

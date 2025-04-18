@@ -1,0 +1,12 @@
+{
+  "namespace": "default",
+  "name": "test",
+  "image": "ghcr.io/wasmcloud/components/http-hello-world-rust:0.1.0",
+  "concurrency": 1,
+  "annotations": {
+    "key": "value"
+  },
+  "wasi_config": {
+    "ENV": "VAR"
+  }
+}

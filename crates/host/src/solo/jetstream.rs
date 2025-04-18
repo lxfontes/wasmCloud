@@ -140,12 +140,6 @@ impl super::Host {
             }
         }
 
-        // If the component is already running, update the links
-        if let Some(component) = self.components.write().await.get(id) {
-            *component.handler.instance_links.write().await = component_import_links(&spec.links);
-            // NOTE(brooksmtownsend): We can consider updating the component if the image URL changes
-        };
-
         // Insert the links into host map
         self.links.write().await.insert(id.to_string(), spec.links);
 
@@ -159,13 +153,6 @@ impl super::Host {
     ) -> anyhow::Result<()> {
         let id = id.as_ref();
         debug!(id, "process component delete");
-        // TODO: TBD: stop component if spec deleted?
-        if self.components.write().await.get(id).is_some() {
-            warn!(
-                component_id = id,
-                "component spec deleted, but component is still running"
-            );
-        }
         Ok(())
     }
 

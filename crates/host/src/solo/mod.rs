@@ -22,7 +22,7 @@ use claims::{Claims, StoredClaims};
 use cloudevents::{EventBuilder, EventBuilderV10};
 use futures::future::Either;
 use futures::stream::{AbortHandle, Abortable, SelectAll};
-use futures::{join, stream, try_join, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{join, stream, try_join, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use nkeys::{KeyPair, KeyPairType, XKey};
 use providers::Provider;
@@ -63,6 +63,7 @@ use crate::{
     RegistryAuth, RegistryConfig, RegistryType, ResourceRef, SecretsManager,
 };
 
+pub mod api;
 mod claims;
 mod event;
 mod experimental;
@@ -149,48 +150,7 @@ impl ControlMapper {
         provider_auction: bool,
     ) -> anyhow::Result<Self> {
         let host_id = host_key.public_key();
-        let mut subs = vec![
-            Either::Left(nats.subscribe(format!(
-                "{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.registry.put",
-            ))),
-            Either::Left(nats.subscribe(format!(
-                "{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.host.ping",
-            ))),
-            Either::Right(nats.queue_subscribe(
-                format!("{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.link.*"),
-                format!("{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.link",),
-            )),
-            Either::Right(nats.queue_subscribe(
-                format!("{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.claims.get"),
-                format!("{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.claims"),
-            )),
-            Either::Left(nats.subscribe(format!(
-                "{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.component.*.{host_id}"
-            ))),
-            Either::Left(nats.subscribe(format!(
-                "{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.provider.*.{host_id}"
-            ))),
-            Either::Left(nats.subscribe(format!(
-                "{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.label.*.{host_id}"
-            ))),
-            Either::Left(nats.subscribe(format!(
-                "{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.host.*.{host_id}"
-            ))),
-            Either::Right(nats.queue_subscribe(
-                format!("{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.config.>"),
-                format!("{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.config"),
-            )),
-        ];
-        if component_auction {
-            subs.push(Either::Left(nats.subscribe(format!(
-                "{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.component.auction",
-            ))));
-        }
-        if provider_auction {
-            subs.push(Either::Left(nats.subscribe(format!(
-                "{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.provider.auction",
-            ))));
-        }
+        let subs = vec![nats.subscribe(format!("{topic_prefix}.{host_id}.>"))];
         let streams = futures::future::join_all(subs)
             .await
             .into_iter()
@@ -207,14 +167,13 @@ type Annotations = BTreeMap<String, String>;
 #[derive(Debug)]
 struct Component {
     component: wasmcloud_runtime::Component<Handler>,
-    /// Unique component identifier for this component
-    id: Arc<str>,
+    wrpc_id: Arc<String>,
     handler: Handler,
     exports: JoinHandle<()>,
     annotations: Annotations,
     /// Maximum number of instances of this component that can be running at once
     max_instances: NonZeroUsize,
-    image_reference: Arc<str>,
+    image: Arc<String>,
     events: mpsc::Sender<WrpcServeEvent<<WrpcServer as wrpc_transport::Serve>::Context>>,
     permits: Arc<Semaphore>,
 }
@@ -231,8 +190,8 @@ impl Deref for Component {
 struct WrpcServer {
     nats: wrpc_transport_nats::Client,
     claims: Option<Arc<jwt::Claims<jwt::Component>>>,
-    id: Arc<str>,
-    image_reference: Arc<str>,
+    id: Arc<String>,
+    image_reference: Arc<String>,
     annotations: Arc<Annotations>,
     metrics: Arc<HostMetrics>,
 }
@@ -280,15 +239,15 @@ impl wrpc_transport::Serve for WrpcServer {
         let instance: Arc<str> = Arc::from(instance);
         let annotations = Arc::clone(&self.annotations);
         let id = Arc::clone(&self.id);
-        let image_reference = Arc::clone(&self.image_reference);
+        let image_reference = Arc::clone(&self.image_reference).to_string();
         let metrics = Arc::clone(&self.metrics);
         let claims = self.claims.clone();
         Ok(invocations.and_then(move |(cx, tx, rx)| {
+            let image_reference = image_reference.clone();
             let annotations = Arc::clone(&annotations);
             let claims = claims.clone();
             let func = Arc::clone(&func);
             let id = Arc::clone(&id);
-            let image_reference = Arc::clone(&image_reference);
             let instance = Arc::clone(&instance);
             let metrics = Arc::clone(&metrics);
             let span = tracing::info_span!("component_invocation", func = %func, id = %id, instance = %instance);
@@ -328,9 +287,18 @@ impl wrpc_transport::Serve for WrpcServer {
     }
 }
 
+#[derive(Debug, Clone)]
+
+enum TrackerEntry {
+    Component(Arc<Component>),
+    Provider(Arc<Provider>),
+}
+type Tracker = HashMap<ComponentId, TrackerEntry>;
+
 /// wasmCloud Host
 pub struct Host {
     components: Arc<RwLock<HashMap<ComponentId, Arc<Component>>>>,
+    tracker: Arc<RwLock<Tracker>>,
     event_builder: EventBuilderV10,
     friendly_name: String,
     heartbeat: AbortHandle,
@@ -889,6 +857,7 @@ impl Host {
 
         let host = Host {
             components: Arc::default(),
+            tracker: Arc::default(),
             event_builder,
             friendly_name,
             heartbeat: heartbeat_abort.clone(),
@@ -1090,7 +1059,7 @@ impl Host {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn inventory(&self) -> HostInventory {
+    async fn component_list(&self) -> HostInventory {
         trace!("generating host inventory");
         let components: Vec<_> = {
             let components = self.components.read().await;
@@ -1098,7 +1067,7 @@ impl Host {
                 .filter_map(|(id, component)| async move {
                     let mut description = ComponentDescription::builder()
                         .id(id.into())
-                        .image_ref(component.image_reference.to_string())
+                        .image_ref(component.image.to_string())
                         .annotations(component.annotations.clone().into_iter().collect())
                         .max_instances(component.max_instances.get().try_into().unwrap_or(u32::MAX))
                         .revision(
@@ -1190,7 +1159,7 @@ impl Host {
     #[instrument(level = "debug", skip_all)]
     async fn heartbeat(&self) -> anyhow::Result<serde_json::Value> {
         trace!("generating heartbeat");
-        Ok(serde_json::to_value(self.inventory().await)?)
+        Ok(serde_json::to_value(self.component_list().await)?)
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1211,17 +1180,18 @@ impl Host {
     async fn instantiate_component(
         &self,
         annotations: &Annotations,
-        image_reference: Arc<str>,
-        id: Arc<str>,
+        image: Arc<String>,
         max_instances: NonZeroUsize,
         mut component: wasmcloud_runtime::Component<Handler>,
         handler: Handler,
     ) -> anyhow::Result<Arc<Component>> {
         trace!(
-            component_ref = ?image_reference,
+            component_ref = ?image,
             max_instances,
             "instantiating component"
         );
+
+        let wrpc_id = Arc::clone(&handler.component_id);
 
         let max_execution_time = self.max_execution_time;
         component.set_max_execution_time(max_execution_time);
@@ -1231,7 +1201,7 @@ impl Host {
                 .get()
                 .clamp(MIN_INVOCATION_CHANNEL_SIZE, MAX_INVOCATION_CHANNEL_SIZE),
         );
-        let prefix = Arc::from(format!("{}.{id}", &self.host_config.lattice));
+        let prefix = Arc::from(format!("{}.{wrpc_id}", &self.host_config.lattice));
         let nats = wrpc_transport_nats::Client::new(
             Arc::clone(&self.rpc_nats),
             Arc::clone(&prefix),
@@ -1243,8 +1213,8 @@ impl Host {
                 &WrpcServer {
                     nats,
                     claims: component.claims().cloned().map(Arc::new),
-                    id: Arc::clone(&id),
-                    image_reference: Arc::clone(&image_reference),
+                    id: Arc::clone(&wrpc_id),
+                    image_reference: Arc::clone(&image),
                     annotations: Arc::new(annotations.clone()),
                     metrics: Arc::clone(&self.metrics),
                 },
@@ -1258,7 +1228,7 @@ impl Host {
         let metrics = Arc::clone(&self.metrics);
         Ok(Arc::new(Component {
             component,
-            id,
+            wrpc_id,
             handler,
             events: events_tx,
             permits: Arc::clone(&permits),
@@ -1339,7 +1309,7 @@ impl Host {
             }),
             annotations: annotations.clone(),
             max_instances,
-            image_reference,
+            image,
         }))
     }
 
@@ -1347,17 +1317,16 @@ impl Host {
     #[instrument(level = "debug", skip_all)]
     async fn start_component<'a>(
         &self,
-        entry: hash_map::VacantEntry<'a, String, Arc<Component>>,
         wasm: &[u8],
         claims: Option<jwt::Claims<jwt::Component>>,
-        component_ref: Arc<str>,
-        component_id: Arc<str>,
+        image: Arc<String>,
+        wrpc_id: Arc<String>,
         max_instances: NonZeroUsize,
         annotations: &Annotations,
-        config: ConfigBundle,
-        secrets: HashMap<String, SecretBox<SecretValue>>,
-    ) -> anyhow::Result<&'a mut Arc<Component>> {
-        debug!(?component_ref, ?max_instances, "starting new component");
+        config: BTreeMap<String, String>,
+        links: Vec<Link>,
+    ) -> anyhow::Result<Arc<Component>> {
+        debug!(?image, ?max_instances, "starting new component");
 
         if let Some(ref claims) = claims {
             self.store_claims(Claims::Component(claims.clone()))
@@ -1365,26 +1334,17 @@ impl Host {
                 .context("failed to store claims")?;
         }
 
-        let component_spec = self
-            .get_component_spec(&component_id)
-            .await?
-            .unwrap_or_else(|| ComponentSpecification::new(&component_ref));
-        self.store_component_spec(&component_id, &component_spec)
-            .await?;
+        let lattice = Arc::new(self.host_config.lattice.to_string());
 
         // Map the imports to pull out the result types of the functions for lookup when invoking them
         let handler = Handler {
             nats: Arc::clone(&self.rpc_nats),
-            config_data: Arc::new(RwLock::new(config)),
-            lattice: Arc::clone(&self.host_config.lattice),
-            component_id: Arc::clone(&component_id),
-            secrets: Arc::new(RwLock::new(secrets)),
-            targets: Arc::default(),
-            instance_links: Arc::new(RwLock::new(component_import_links(&component_spec.links))),
-            messaging_links: {
-                let mut links = self.messaging_links.write().await;
-                Arc::clone(links.entry(Arc::clone(&component_id)).or_default())
-            },
+            wasi_config: Arc::new(RwLock::new(config)),
+            lattice: Arc::clone(&lattice),
+            component_id: Arc::clone(&wrpc_id),
+            link_targets: Arc::default(),
+            link_instances: Arc::new(RwLock::new(component_import_links(&links))),
+            messaging_links: Arc::default(),
             invocation_timeout: Duration::from_secs(10), // TODO: Make this configurable
             experimental_features: self.experimental_features,
             host_labels: Arc::clone(&self.labels),
@@ -1393,8 +1353,7 @@ impl Host {
         let component = self
             .instantiate_component(
                 annotations,
-                Arc::clone(&component_ref),
-                Arc::clone(&component_id),
+                Arc::clone(&image),
                 max_instances,
                 component,
                 handler,
@@ -1402,26 +1361,14 @@ impl Host {
             .await
             .context("failed to instantiate component")?;
 
-        info!(?component_ref, "component started");
-        self.publish_event(
-            "component_scaled",
-            event::component_scaled(
-                claims.as_ref(),
-                annotations,
-                self.host_key.public_key(),
-                max_instances,
-                &component_ref,
-                &component_id,
-            ),
-        )
-        .await?;
+        info!(?image, "component started");
 
-        Ok(entry.insert(component))
+        Ok(component)
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn stop_component(&self, component: &Component, _host_id: &str) -> anyhow::Result<()> {
-        trace!(component_id = %component.id, "stopping component");
+    async fn stop_component(&self, component: Arc<Component>) -> anyhow::Result<()> {
+        trace!(component_id = %component.wrpc_id, "stopping component");
 
         component.exports.abort();
 
@@ -1452,41 +1399,8 @@ impl Host {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn handle_stop_host(
-        &self,
-        payload: impl AsRef<[u8]>,
-        transport_host_id: &str,
-    ) -> anyhow::Result<CtlResponse<()>> {
-        // Allow an empty payload to be used for stopping hosts
-        let timeout = if payload.as_ref().is_empty() {
-            None
-        } else {
-            let cmd = serde_json::from_slice::<StopHostCommand>(payload.as_ref())
-                .context("failed to deserialize stop command")?;
-            let timeout = cmd.timeout();
-            let host_id = cmd.host_id();
-
-            // If the Host ID was provided (i..e not the empty string, due to #[serde(default)]), then
-            // we should check it against the known transport-provided host_id, and this actual host's ID
-            if !host_id.is_empty() {
-                anyhow::ensure!(
-                    host_id == transport_host_id && host_id == self.host_key.public_key(),
-                    "invalid host_id [{host_id}]"
-                );
-            }
-            timeout
-        };
-
-        // It *should* be impossible for the transport-derived host ID to not match at this point
-        anyhow::ensure!(
-            transport_host_id == self.host_key.public_key(),
-            "invalid host_id [{transport_host_id}]"
-        );
-
-        let mut stop_command = StopHostCommand::builder().host_id(transport_host_id);
-        if let Some(timeout) = timeout {
-            stop_command = stop_command.timeout(timeout);
-        }
+    async fn handle_stop_host(&self, _payload: impl AsRef<[u8]>) -> anyhow::Result<Vec<u8>> {
+        let timeout: Option<u64> = Some(3000);
 
         info!(?timeout, "handling stop host");
 
@@ -1498,506 +1412,165 @@ impl Host {
         let deadline =
             timeout.and_then(|timeout| Instant::now().checked_add(Duration::from_millis(timeout)));
         self.stop_tx.send_replace(deadline);
-        Ok(CtlResponse::<()>::success(
-            "successfully handled stop host".into(),
-        ))
+
+        api::Response::<()>::success(()).serialize()
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn handle_scale_component(
+    async fn handle_stop_component(
         self: Arc<Self>,
         payload: impl AsRef<[u8]>,
-    ) -> anyhow::Result<CtlResponse<()>> {
-        let request = serde_json::from_slice::<ScaleComponentCommand>(payload.as_ref())
-            .context("failed to deserialize component scale command")?;
+    ) -> anyhow::Result<Vec<u8>> {
+        let request: api::Request<api::StopComponentRequest> = payload.as_ref().try_into()?;
 
-        let component_ref = request.component_ref();
-        let component_id = request.component_id();
-        let annotations = request.annotations();
-        let max_instances = request.max_instances();
-        let config = request.config().clone();
-        let allow_update = request.allow_update();
-        let host_id = request.host_id();
+        let component_id = request.payload.id;
+        let mut tracker = self.tracker.write().await;
+        match tracker.remove(&component_id) {
+            Some(TrackerEntry::Component(item)) => {
+                self.stop_component(item.clone()).await?;
+                api::Response::success_with_message(
+                    "stopped".to_string(),
+                    api::StopComponentResponse {},
+                )
+                .serialize()
+            }
+            _ => api::Response::success_with_message(
+                "not found".to_string(),
+                api::StopComponentResponse {},
+            )
+            .serialize(),
+        }
+    }
 
-        debug!(
-            component_ref,
-            max_instances, component_id, "handling scale component"
-        );
+    #[instrument(level = "debug", skip_all)]
+    async fn handle_start_component(
+        self: Arc<Self>,
+        payload: impl AsRef<[u8]>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let request: api::Request<api::StartComponentRequest> = payload.as_ref().try_into()?;
 
-        let host_id = host_id.to_string();
-        let annotations: Annotations = annotations
-            .cloned()
+        let component_id = uuid::Uuid::new_v4();
+        let component_ref = request.payload.image;
+        let max_instances = match NonZeroUsize::new(request.payload.concurrency as usize) {
+            Some(max_instances) => max_instances,
+            None => return Err(anyhow::anyhow!("concurrency must be greater than 0")),
+        };
+        let wasi_config = request.payload.wasi_config.unwrap_or_default();
+        let annotations: Annotations = request
+            .payload
+            .annotations
+            .clone()
             .unwrap_or_default()
             .into_iter()
             .collect();
 
-        // Basic validation to ensure that the component is running and that the image reference matches
-        // If it doesn't match, we can still successfully scale, but we won't be updating the image reference
-        let (original_ref, ref_changed) = {
-            self.components
-                .read()
-                .await
-                .get(component_id)
-                .map(|v| {
-                    (
-                        Some(Arc::clone(&v.image_reference)),
-                        &*v.image_reference != component_ref,
-                    )
-                })
-                .unwrap_or_else(|| (None, false))
-        };
-
-        let mut perform_post_update: bool = false;
-        let message = match (allow_update, original_ref, ref_changed) {
-            // Updates are not allowed, original ref changed
-            (false, Some(original_ref), true) => {
-                let msg = format!(
-                "Requested to scale existing component to a different image reference: {original_ref} != {component_ref}. The component will be scaled but the image reference will not be updated. If you meant to update this component to a new image ref, use the update command."
-            );
-                warn!(msg);
-                msg
-            }
-            // Updates are allowed, ref changed and we'll do an update later
-            (true, Some(original_ref), true) => {
-                perform_post_update = true;
-                format!(
-                "Requested to scale existing component, with a changed image reference: {original_ref} != {component_ref}. The component will be scaled, and the image reference will be updated afterwards."
-            )
-            }
-            _ => String::with_capacity(0),
-        };
-
-        let component_id = Arc::from(component_id);
-        let component_ref = Arc::from(component_ref);
-        // Spawn a task to perform the scaling and possibly an update of the component afterwards
-        spawn(async move {
-            // Fetch the component from the reference
-            let component_and_claims =
-                self.fetch_component(&component_ref)
-                    .await
-                    .map(|component_bytes| {
-                        // Pull the claims token from the component, this returns an error only if claims are embedded
-                        // and they are invalid (expired, tampered with, etc)
-                        let claims_token =
-                            wasmcloud_runtime::component::claims_token(&component_bytes);
-                        (component_bytes, claims_token)
-                    });
-            let (wasm, claims_token, retrieval_error) = match component_and_claims {
-                Ok((wasm, Ok(claims_token))) => (Some(wasm), claims_token, None),
-                Ok((_, Err(e))) => {
-                    if let Err(e) = self
-                        .publish_event(
-                            "component_scale_failed",
-                            event::component_scale_failed(
-                                None,
-                                &annotations,
-                                host_id,
-                                &component_ref,
-                                &component_id,
-                                max_instances,
-                                &e,
-                            ),
-                        )
-                        .await
-                    {
-                        error!(%component_ref, %component_id, err = ?e, "failed to publish component scale failed event");
-                    }
-                    return;
-                }
-                Err(e) => (None, None, Some(e)),
-            };
-            // Scale the component
-            if let Err(e) = self
-                .handle_scale_component_task(
-                    Arc::clone(&component_ref),
-                    Arc::clone(&component_id),
-                    &host_id,
-                    max_instances,
-                    &annotations,
-                    config,
-                    wasm.ok_or_else(|| {
-                        retrieval_error.unwrap_or_else(|| anyhow!("unexpected missing wasm binary"))
-                    }),
-                    claims_token.as_ref(),
-                )
-                .await
-            {
-                error!(%component_ref, %component_id, err = ?e, "failed to scale component");
-                if let Err(e) = self
-                    .publish_event(
-                        "component_scale_failed",
-                        event::component_scale_failed(
-                            claims_token.map(|c| c.claims).as_ref(),
-                            &annotations,
-                            host_id,
-                            &component_ref,
-                            &component_id,
-                            max_instances,
-                            &e,
-                        ),
-                    )
-                    .await
-                {
-                    error!(%component_ref, %component_id, err = ?e, "failed to publish component scale failed event");
-                }
-                return;
-            }
-
-            if perform_post_update {
-                if let Err(e) = self
-                    .handle_update_component_task(
-                        Arc::clone(&component_id),
-                        Arc::clone(&component_ref),
-                        &host_id,
-                        None,
-                    )
-                    .await
-                {
-                    error!(%component_ref, %component_id, err = ?e, "failed to update component after scale");
-                }
-            }
-        });
-
-        Ok(CtlResponse::<()>::success(message))
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    /// Handles scaling an component to a supplied number of `max` concurrently executing instances.
-    /// Supplying `0` will result in stopping that component instance.
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_scale_component_task(
-        &self,
-        component_ref: Arc<str>,
-        component_id: Arc<str>,
-        host_id: &str,
-        max_instances: u32,
-        annotations: &Annotations,
-        config: Vec<String>,
-        wasm: anyhow::Result<Vec<u8>>,
-        claims_token: Option<&jwt::Token<jwt::Component>>,
-    ) -> anyhow::Result<()> {
-        trace!(?component_ref, max_instances, "scale component task");
+        // Fetch the component from the reference
+        let component_bytes = self.fetch_component(&component_ref).await?;
+        // Pull the claims token from the component, this returns an error only if claims are embedded
+        // and they are invalid (expired, tampered with, etc)
+        let claims_token = wasmcloud_runtime::component::claims_token(&component_bytes)?;
 
         let claims = claims_token.map(|c| c.claims.clone());
+        let links = Vec::<Link>::default();
 
-        let scaled_event = match (
-            self.components
-                .write()
-                .await
-                .entry(component_id.to_string()),
-            NonZeroUsize::new(max_instances as usize),
-        ) {
-            // No component is running and we requested to scale to zero, noop.
-            // We still publish the event to indicate that the component has been scaled to zero
-            (hash_map::Entry::Vacant(_), None) => event::component_scaled(
-                claims.as_ref(),
-                annotations,
-                host_id,
-                0_usize,
-                &component_ref,
-                &component_id,
-            ),
-            // No component is running and we requested to scale to some amount, start with specified max
-            (hash_map::Entry::Vacant(entry), Some(max)) => {
-                let (config, secrets) = self
-                    .fetch_config_and_secrets(
-                        &config,
-                        claims_token.as_ref().map(|c| &c.jwt),
-                        annotations.get("wasmcloud.dev/appspec"),
-                    )
-                    .await?;
-                match &wasm {
-                    Ok(wasm) => {
-                        self.start_component(
-                            entry,
-                            wasm,
-                            claims.clone(),
-                            Arc::clone(&component_ref),
-                            Arc::clone(&component_id),
-                            max,
-                            annotations,
-                            config,
-                            secrets,
-                        )
-                        .await?;
-
-                        event::component_scaled(
-                            claims.as_ref(),
-                            annotations,
-                            host_id,
-                            max,
-                            &component_ref,
-                            &component_id,
-                        )
-                    }
-                    Err(e) => {
-                        error!(%component_ref, %component_id, err = ?e, "failed to scale component");
-                        if let Err(e) = self
-                            .publish_event(
-                                "component_scale_failed",
-                                event::component_scale_failed(
-                                    claims_token.map(|c| c.claims.clone()).as_ref(),
-                                    annotations,
-                                    host_id,
-                                    &component_ref,
-                                    &component_id,
-                                    max_instances,
-                                    e,
-                                ),
-                            )
-                            .await
-                        {
-                            error!(%component_ref, %component_id, err = ?e, "failed to publish component scale failed event");
-                        }
-                        return Ok(());
-                    }
-                }
-            }
-            // Component is running and we requested to scale to zero instances, stop component
-            (hash_map::Entry::Occupied(entry), None) => {
-                let component = entry.remove();
-                self.stop_component(&component, host_id)
-                    .await
-                    .context("failed to stop component in response to scale to zero")?;
-
-                info!(?component_ref, "component stopped");
-                event::component_scaled(
-                    claims.as_ref(),
-                    &component.annotations,
-                    host_id,
-                    0_usize,
-                    &component.image_reference,
-                    &component.id,
-                )
-            }
-            // Component is running and we requested to scale to some amount or unbounded, scale component
-            (hash_map::Entry::Occupied(mut entry), Some(max)) => {
-                let component = entry.get_mut();
-                let config_changed =
-                    &config != component.handler.config_data.read().await.config_names();
-
-                // Create the event first to avoid borrowing the component
-                // This event is idempotent.
-                let event = event::component_scaled(
-                    claims.as_ref(),
-                    &component.annotations,
-                    host_id,
-                    max,
-                    &component.image_reference,
-                    &component.id,
-                );
-
-                // Modify scale only if the requested max differs from the current max or if the configuration has changed
-                if component.max_instances != max || config_changed {
-                    // We must partially clone the handler as we can't be sharing the targets between components
-                    let handler = component.handler.copy_for_new();
-                    if config_changed {
-                        let (config, secrets) = self
-                            .fetch_config_and_secrets(
-                                &config,
-                                claims_token.as_ref().map(|c| &c.jwt),
-                                annotations.get("wasmcloud.dev/appspec"),
-                            )
-                            .await?;
-                        *handler.config_data.write().await = config;
-                        *handler.secrets.write().await = secrets;
-                    }
-                    let instance = self
-                        .instantiate_component(
-                            annotations,
-                            Arc::clone(&component_ref),
-                            Arc::clone(&component.id),
-                            max,
-                            component.component.clone(),
-                            handler,
-                        )
-                        .await
-                        .context("failed to instantiate component")?;
-                    let component = entry.insert(instance);
-                    self.stop_component(&component, host_id)
-                        .await
-                        .context("failed to stop component after scaling")?;
-
-                    info!(?component_ref, ?max, "component scaled");
-                } else {
-                    debug!(?component_ref, ?max, "component already at desired scale");
-                }
-                event
-            }
-        };
-
-        self.publish_event("component_scaled", scaled_event).await?;
-
-        Ok(())
-    }
-
-    async fn handle_update_component_task(
-        &self,
-        component_id: Arc<str>,
-        new_component_ref: Arc<str>,
-        host_id: &str,
-        annotations: Option<BTreeMap<String, String>>,
-    ) -> anyhow::Result<()> {
-        // NOTE: This block is specifically scoped to ensure we drop the read lock on `self.components` before
-        // we attempt to grab a write lock.
-        let component = {
-            let components = self.components.read().await;
-            let existing_component = components
-                .get(&*component_id)
-                .context("component not found")?;
-            let annotations = annotations.unwrap_or_default().into_iter().collect();
-
-            // task is a no-op if the component image reference is the same
-            if existing_component.image_reference == new_component_ref {
-                info!(%component_id, %new_component_ref, "component already updated");
-                return Ok(());
-            }
-
-            let new_component = self.fetch_component(&new_component_ref).await?;
-            let new_component = wasmcloud_runtime::Component::new(&self.runtime, &new_component)
-                .context("failed to initialize component")?;
-            let new_claims = new_component.claims().cloned();
-            if let Some(ref claims) = new_claims {
-                self.store_claims(Claims::Component(claims.clone()))
-                    .await
-                    .context("failed to store claims")?;
-            }
-
-            let max = existing_component.max_instances;
-            let Ok(component) = self
-                .instantiate_component(
-                    &annotations,
-                    Arc::clone(&new_component_ref),
-                    Arc::clone(&component_id),
-                    max,
-                    new_component,
-                    existing_component.handler.copy_for_new(),
-                )
-                .await
-            else {
-                bail!("failed to instantiate component from new reference");
-            };
-
-            info!(%new_component_ref, "component updated");
-            self.publish_event(
-                "component_scaled",
-                event::component_scaled(
-                    new_claims.as_ref(),
-                    &component.annotations,
-                    host_id,
-                    max,
-                    new_component_ref,
-                    &component_id,
-                ),
+        let component = self
+            .start_component(
+                component_bytes.as_ref(),
+                claims.clone(),
+                Arc::new(component_ref.to_string()),
+                Arc::new(component_id.to_string()),
+                max_instances,
+                &annotations,
+                wasi_config,
+                links,
             )
             .await?;
 
-            // TODO(#1548): If this errors, we need to rollback
-            self.stop_component(&component, host_id)
-                .await
-                .context("failed to stop old component")?;
-            self.publish_event(
-                "component_scaled",
-                event::component_scaled(
-                    component.claims(),
-                    &component.annotations,
-                    host_id,
-                    0_usize,
-                    &component.image_reference,
-                    &component.id,
-                ),
-            )
-            .await?;
+        let mut tracker = self.tracker.write().await;
+        tracker.insert(
+            component_id.to_string(),
+            TrackerEntry::Component(Arc::clone(&component)),
+        );
 
-            component
-        };
+        let response = api::Response::success_with_message(
+            "successfully started component".to_string(),
+            api::StartComponentResponse {
+                id: component_id.to_string(),
+            },
+        );
 
-        self.components
-            .write()
-            .await
-            .insert(component_id.to_string(), component);
-        Ok(())
+        response.serialize()
     }
 
     #[instrument(level = "debug", skip_all)]
     async fn handle_start_provider(
         self: Arc<Self>,
         payload: impl AsRef<[u8]>,
-    ) -> anyhow::Result<Option<CtlResponse<()>>> {
-        let request = serde_json::from_slice::<StartProviderCommand>(payload.as_ref())
-            .context("failed to deserialize provider start command")?;
-
-        if self
-            .providers
-            .read()
-            .await
-            .contains_key(request.provider_id())
-        {
-            return Ok(Some(CtlResponse::error(
-                "provider with that ID is already running",
-            )));
-        }
+    ) -> anyhow::Result<Vec<u8>> {
+        let request: api::Request<api::StartProviderRequest> = payload.as_ref().try_into()?;
 
         // Avoid responding to start providers for builtin providers if they're not enabled
-        if let Ok(ResourceRef::Builtin(name)) = ResourceRef::try_from(request.provider_ref()) {
+        if let Ok(ResourceRef::Builtin(name)) =
+            ResourceRef::try_from(request.payload.image.as_str())
+        {
             if !self.experimental_features.builtin_http_server && name == "http-server" {
-                debug!(
-                    provider_ref = request.provider_ref(),
-                    provider_id = request.provider_id(),
-                    "skipping start provider for disabled builtin http provider"
-                );
-                return Ok(None);
+                return api::Response::error_with_message(
+                    "builtin http-server provider is not enabled".to_string(),
+                    (),
+                )
+                .serialize();
             }
             if !self.experimental_features.builtin_messaging_nats && name == "messaging-nats" {
-                debug!(
-                    provider_ref = request.provider_ref(),
-                    provider_id = request.provider_id(),
-                    "skipping start provider for disabled builtin messaging provider"
-                );
-                return Ok(None);
+                return api::Response::error_with_message(
+                    "builtin messaging-nats provider is not enabled".to_string(),
+                    (),
+                )
+                .serialize();
             }
         }
 
         // NOTE: We log at info since starting providers can take a while
         info!(
-            provider_ref = request.provider_ref(),
-            provider_id = request.provider_id(),
+            provider_ref = request.payload.image,
+            provider_id = request.payload.name,
             "handling start provider"
         );
 
-        let host_id = request.host_id().to_string();
+        let host_key = self.host_key.public_key();
+        let host_id = host_key.to_string();
         spawn(async move {
-            let config = request.config();
-            let provider_id = request.provider_id();
-            let provider_ref = request.provider_ref();
-            let annotations = request.annotations();
+            // let config = request.config();
+            // let provider_id = request.provider_id();
+            // let provider_ref = request.provider_ref();
+            // let annotations = request.annotations();
 
-            if let Err(err) = Arc::clone(&self)
-                .handle_start_provider_task(
-                    config,
-                    provider_id,
-                    provider_ref,
-                    annotations.cloned().unwrap_or_default(),
-                    &host_id,
-                )
-                .await
-            {
-                error!(provider_ref, provider_id, ?err, "failed to start provider");
-                if let Err(err) = self
-                    .publish_event(
-                        "provider_start_failed",
-                        event::provider_start_failed(provider_ref, provider_id, host_id, &err),
-                    )
-                    .await
-                {
-                    error!(?err, "failed to publish provider_start_failed event");
-                }
-            }
+            // if let Err(err) = Arc::clone(&self)
+            //     .handle_start_provider_task(
+            //         config,
+            //         provider_id,
+            //         provider_ref,
+            //         annotations.cloned().unwrap_or_default(),
+            //     )
+            //     .await
+            // {
+            //     error!(provider_ref, provider_id, ?err, "failed to start provider");
+            //     if let Err(err) = self
+            //         .publish_event(
+            //             "provider_start_failed",
+            //             event::provider_start_failed(provider_ref, provider_id, host_id, &err),
+            //         )
+            //         .await
+            //     {
+            //         error!(?err, "failed to publish provider_start_failed event");
+            //     }
+            // }
         });
 
-        Ok(Some(CtlResponse::<()>::success(
-            "successfully started provider".into(),
-        )))
+        api::Response::success_with_message(
+            "successfully started provider".to_string(),
+            api::StartProviderResponse { id: "".to_string() },
+        )
+        .serialize()
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -2005,15 +1578,18 @@ impl Host {
         self: Arc<Self>,
         config_names: &[String],
         provider_id: &str,
-        provider_ref: &str,
+        image: &str,
         annotations: BTreeMap<String, String>,
-        host_id: &str,
     ) -> anyhow::Result<()> {
-        trace!(provider_ref, provider_id, "start provider task");
+        trace!(image, provider_id, "start provider task");
+
+        // NOTE(lxf): refactor
+        // This host id is only needed for caching
+        let host_id = self.host_key.public_key().to_string();
 
         let registry_config = self.registry_config.read().await;
         let provider_ref =
-            ResourceRef::try_from(provider_ref).context("failed to parse provider reference")?;
+            ResourceRef::try_from(image).context("failed to parse provider reference")?;
         let (path, claims_token) = match &provider_ref {
             ResourceRef::Builtin(..) => (None, None),
             _ => {
@@ -2038,14 +1614,6 @@ impl Host {
         }
 
         let annotations: Annotations = annotations.into_iter().collect();
-
-        let component_specification = self
-            .get_component_spec(provider_id)
-            .await?
-            .unwrap_or_else(|| ComponentSpecification::new(provider_ref.as_ref()));
-
-        self.store_component_spec(&provider_id, &component_specification)
-            .await?;
 
         let mut providers = self.providers.write().await;
         if let hash_map::Entry::Vacant(entry) = providers.entry(provider_id.into()) {
@@ -2108,17 +1676,6 @@ impl Host {
                 provider_ref = provider_ref.as_ref(),
                 provider_id, "provider started"
             );
-            self.publish_event(
-                "provider_started",
-                event::provider_started(
-                    claims.as_ref(),
-                    &annotations,
-                    host_id,
-                    &provider_ref,
-                    provider_id,
-                ),
-            )
-            .await?;
 
             // Add the provider
             entry.insert(Provider {
@@ -2212,13 +1769,13 @@ impl Host {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn handle_component_list(&self) -> anyhow::Result<CtlResponse<HostInventory>> {
-        let inventory = self.inventory().await;
-        Ok(CtlResponse::ok(inventory))
+    async fn handle_component_list(&self) -> anyhow::Result<Vec<u8>> {
+        let inventory = self.component_list().await;
+        api::Response::<HostInventory>::success(inventory).serialize()
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn handle_ping(&self) -> anyhow::Result<CtlResponse<wasmcloud_control_interface::Host>> {
+    async fn handle_ping(&self) -> anyhow::Result<Vec<u8>> {
         trace!("replying to ping");
         let uptime = self.start_at.elapsed();
 
@@ -2241,7 +1798,7 @@ impl Host {
             .build()
             .map_err(|e| anyhow!("failed to build host message: {e}"))?;
 
-        Ok(CtlResponse::ok(host))
+        api::Response::<()>::success(()).serialize()
     }
 
     #[instrument(level = "trace", skip_all, fields(subject = %message.subject))]
@@ -2250,16 +1807,23 @@ impl Host {
         // disabled. In most cases that's fine, since we aren't aware of any control interface
         // requests including a trace context
         opentelemetry_nats::attach_span_context(&message);
+        let reply_to = match message.reply {
+            Some(reply_to) => reply_to,
+            None => return,
+        };
         // Skip the topic prefix, the version, and the lattice
         // e.g. `wasmbus.ctl.v1.{prefix}`
         let subject = message.subject;
+        let host_key = self.host_key.public_key();
         let mut parts = subject
             .trim()
             .trim_start_matches(&self.ctl_topic_prefix)
             .trim_start_matches('.')
+            .trim_start_matches(host_key.as_str())
             .split('.')
-            .skip(2);
+            .skip(1);
         trace!(%subject, "handling control interface request");
+        println!("parts: {:?}", parts.clone().collect::<Vec<_>>());
 
         // This response is a wrapped Result<Option<Result<Vec<u8>>>> for a good reason.
         // The outer Result is for reporting protocol errors in handling the request, e.g. failing to
@@ -2269,96 +1833,56 @@ impl Host {
         // The inner Result is purely for the success or failure of serializing the [CtlResponse], which
         //    should never fail but it's a result we must handle.
         // And finally, the Vec<u8> is the serialized [CtlResponse] that we'll send back to the client
-        let ctl_response = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        let ctl_response = match (parts.next(), parts.next(), parts.next()) {
             // Component commands
-            (Some("component"), Some("scale"), Some(_host_id), None) => Arc::clone(&self)
-                .handle_scale_component(message.payload)
-                .await
-                .map(Some)
-                .map(serialize_ctl_response),
+            (Some("start"), Some("component"), None) => {
+                Arc::clone(&self)
+                    .handle_start_component(message.payload)
+                    .await
+            }
+            (Some("stop"), Some("component"), None) => {
+                Arc::clone(&self)
+                    .handle_stop_component(message.payload)
+                    .await
+            }
             // Provider commands
-            (Some("provider"), Some("start"), Some(_host_id), None) => Arc::clone(&self)
-                .handle_start_provider(message.payload)
-                .await
-                .map(serialize_ctl_response),
-            (Some("provider"), Some("stop"), Some(_host_id), None) => self
-                .handle_stop_provider(message.payload)
-                .await
-                .map(Some)
-                .map(serialize_ctl_response),
-            // Host commands
-            (Some("component"), Some("list"), None, None) => self
-                .handle_component_list()
-                .await
-                .map(Some)
-                .map(serialize_ctl_response),
-            (Some("ping"), None, None, None) => self
-                .handle_ping()
-                .await
-                .map(Some)
-                .map(serialize_ctl_response),
-            (Some("shutdown"), None, None, None) => self
-                .handle_stop_host(message.payload, self.host_key.public_key().as_str())
-                .await
-                .map(Some)
-                .map(serialize_ctl_response),
+            (Some("start"), Some("provider"), None) => {
+                Arc::clone(&self)
+                    .handle_start_provider(message.payload)
+                    .await
+            }
+            // (Some("provider"), Some("stop"), None) => self
+            //     .handle_stop_provider(message.payload)
+            //     .await
+            //     .map(Some)
+            //     .map(serialize_ctl_response),
+            // // Host commands
+            (Some("list"), Some("component"), None) => self.handle_component_list().await,
+            (Some("ping"), None, None) => self.handle_ping().await,
+            (Some("shutdown"), None, None) => self.handle_stop_host(message.payload).await,
             _ => {
                 warn!(%subject, "received control interface request on unsupported subject");
-                Ok(serialize_ctl_response(Some(CtlResponse::error(
-                    "unsupported subject",
-                ))))
+                api::Response::<()>::error_with_message(
+                    "unsupported control interface request".to_string(),
+                    (),
+                )
+                .serialize()
             }
         };
 
-        if let Err(err) = &ctl_response {
-            error!(%subject, ?err, "failed to handle control interface request");
-        } else {
-            trace!(%subject, "handled control interface request");
-        }
-
-        if let Some(reply) = message.reply {
-            let headers = injector_to_headers(&TraceContextInjector::default_with_span());
-
-            let payload: Option<Bytes> = match ctl_response {
-                Ok(Some(Ok(payload))) => Some(payload.into()),
-                // No response from the host (e.g. auctioning provider)
-                Ok(None) => None,
-                Err(e) => Some(
-                    serde_json::to_vec(&CtlResponse::error(&e.to_string()))
-                        .context("failed to encode control interface response")
-                        // This should never fail to serialize, but the fallback ensures that we send
-                        // something back to the client even if we somehow fail.
-                        .unwrap_or_else(|_| format!(r#"{{"success":false,"error":"{e}"}}"#).into())
-                        .into(),
-                ),
-                // This would only occur if we failed to serialize a valid CtlResponse. This is
-                // programmer error.
-                Ok(Some(Err(e))) => Some(
-                    serde_json::to_vec(&CtlResponse::error(&e.to_string()))
-                        .context("failed to encode control interface response")
-                        .unwrap_or_else(|_| format!(r#"{{"success":false,"error":"{e}"}}"#).into())
-                        .into(),
-                ),
-            };
-
-            if let Some(payload) = payload {
-                let max_payload = self.ctl_nats.server_info().max_payload;
-                if payload.len() > max_payload {
-                    warn!(
-                        size = payload.len(),
-                        max_size = max_payload,
-                        "ctl response payload is too large to publish and may fail",
-                    );
-                }
+        match ctl_response {
+            Ok(payload) => {
+                let headers = injector_to_headers(&TraceContextInjector::default_with_span());
                 if let Err(err) = self
                     .ctl_nats
-                    .publish_with_headers(reply.clone(), headers, payload)
-                    .err_into::<anyhow::Error>()
-                    .and_then(|()| self.ctl_nats.flush().err_into::<anyhow::Error>())
+                    .publish_with_headers(reply_to, headers, payload.into())
                     .await
                 {
-                    error!(%subject, ?err, "failed to publish reply to control interface request");
+                    error!(%subject, ?err, "failed to send control interface response");
                 }
+            }
+            Err(err) => {
+                error!(%subject, ?err, "failed to handle control interface request");
             }
         }
     }

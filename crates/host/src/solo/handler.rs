@@ -40,36 +40,22 @@ const WASMCLOUD_SELECTOR_TYPE: &str = "wasmcloud";
 // Similar to the existing Kubernetes types: https://github.com/maxlambrecht/rust-spiffe/blob/929a090f99d458dd67fa499b74afbeb2fc44b114/spire-api/src/selectors.rs#L38-L39
 const WASMCLOUD_SELECTOR_COMPONENT: &str = "component";
 
+type LinkTargets = HashMap<Box<str>, Arc<str>>;
+type LinkInstances = HashMap<Box<str>, HashMap<Box<str>, Box<str>>>;
 #[derive(Clone, Debug)]
 pub struct Handler {
     pub nats: Arc<async_nats::Client>,
-    // ConfigBundle is perfectly safe to pass around, but in order to update it on the fly, we need
-    // to have it behind a lock since it can be cloned and because the `Actor` struct this gets
-    // placed into is also inside of an Arc
-    pub config_data: Arc<RwLock<ConfigBundle>>,
-    /// Secrets are cached per-[`Handler`] so they can be used at runtime without consulting the secrets
-    /// backend for each request. The [`SecretValue`] is wrapped in the [`Secret`] type from the `secrecy`
-    /// crate to ensure that it is not accidentally logged or exposed in error messages.
-    pub secrets: Arc<RwLock<HashMap<String, SecretBox<SecretValue>>>>,
+    /// The WASI config for the component
+    pub wasi_config: Arc<RwLock<BTreeMap<String, String>>>,
     /// The lattice this handler will use for RPC
-    pub lattice: Arc<str>,
+    pub lattice: Arc<String>,
     /// The identifier of the component that this handler is associated with
-    pub component_id: Arc<str>,
-    /// The current link targets. `instance` -> `link-name`
-    /// Instance specification does not include a version
-    pub targets: Arc<RwLock<HashMap<Box<str>, Arc<str>>>>,
+    pub component_id: Arc<String>,
 
-    /// Map of link names -> instance -> Target
-    ///
-    /// While a target may often be a component ID, it is not guaranteed to be one, and could be
-    /// some other identifier of where to send invocations, representing one or more lattice entities.
-    ///
-    /// Lattice entities could be:
-    /// - A (single) Component ID
-    /// - A routing group
-    /// - Some other opaque string
+    pub link_targets: Arc<RwLock<LinkTargets>>,
     #[allow(clippy::type_complexity)]
-    pub instance_links: Arc<RwLock<HashMap<Box<str>, HashMap<Box<str>, Box<str>>>>>,
+    pub link_instances: Arc<RwLock<LinkInstances>>,
+
     /// Link name -> messaging client
     pub messaging_links: Arc<RwLock<HashMap<Box<str>, async_nats::Client>>>,
 
@@ -81,17 +67,17 @@ pub struct Handler {
 }
 
 impl Handler {
+    pub fn test(&self) {}
     /// Used for creating a new handler from an existing one. This is different than clone because
     /// some fields shouldn't be copied between component instances such as link targets.
     pub fn copy_for_new(&self) -> Self {
         Handler {
             nats: self.nats.clone(),
-            config_data: self.config_data.clone(),
-            secrets: self.secrets.clone(),
+            wasi_config: self.wasi_config.clone(),
             lattice: self.lattice.clone(),
             component_id: self.component_id.clone(),
-            targets: Arc::default(),
-            instance_links: self.instance_links.clone(),
+            link_targets: Arc::default(),
+            link_instances: self.link_instances.clone(),
             messaging_links: self.messaging_links.clone(),
             invocation_timeout: self.invocation_timeout,
             experimental_features: self.experimental_features,
@@ -102,37 +88,11 @@ impl Handler {
 
 #[async_trait]
 impl Bus1_0_0 for Handler {
-    /// Set the current link name in use by the handler, which is otherwise "default".
-    ///
-    /// Link names are important to set to differentiate similar operations (ex. `wasi:keyvalue/store.get`)
-    /// that should go to different targets (ex. a capability provider like `kv-redis` vs `kv-vault`)
+    // NOTE(lxf): refactor
+    // Not sure if we want to implement this
     #[instrument(level = "debug", skip(self))]
     async fn set_link_name(&self, link_name: String, interfaces: Vec<Arc<CallTargetInterface>>) {
-        let interfaces = interfaces.iter().map(Deref::deref);
-        let mut targets = self.targets.write().await;
-        if link_name == "default" {
-            for CallTargetInterface {
-                namespace,
-                package,
-                interface,
-            } in interfaces
-            {
-                targets.remove(&format!("{namespace}:{package}/{interface}").into_boxed_str());
-            }
-        } else {
-            let link_name = Arc::from(link_name);
-            for CallTargetInterface {
-                namespace,
-                package,
-                interface,
-            } in interfaces
-            {
-                targets.insert(
-                    format!("{namespace}:{package}/{interface}").into_boxed_str(),
-                    Arc::clone(&link_name),
-                );
-            }
-        }
+        println!("set_link_name: {:?}", link_name);
     }
 }
 
@@ -148,29 +108,7 @@ impl Bus for Handler {
         link_name: String,
         interfaces: Vec<Arc<CallTargetInterface>>,
     ) -> anyhow::Result<Result<(), String>> {
-        let links = self.instance_links.read().await;
-        // Ensure that all interfaces have an established link with the given name.
-        if let Some(interface_missing_link) = interfaces.iter().find_map(|i| {
-            let instance = i.as_instance();
-            // This could be expressed in one line as a `!(bool).then_some`, but the negation makes it confusing
-            if links
-                .get(link_name.as_str())
-                .and_then(|l| l.get(instance.as_str()))
-                .is_none()
-            {
-                Some(instance)
-            } else {
-                None
-            }
-        }) {
-            return Ok(Err(format!(
-                "interface `{interface_missing_link}` does not have an existing link with name `{link_name}`"
-            )));
-        }
-        // Explicitly drop the lock before calling `set_link_name` just to avoid holding the lock for longer than needed
-        drop(links);
-
-        Bus1_0_0::set_link_name(self, link_name, interfaces).await;
+        println!("set_link_name: {:?}", link_name);
         Ok(Ok(()))
     }
 }
@@ -192,8 +130,8 @@ impl wrpc_transport::Invoke for Handler {
     where
         P: AsRef<[Option<usize>]> + Send + Sync,
     {
-        let links = self.instance_links.read().await;
-        let targets = self.targets.read().await;
+        let links = self.link_instances.read().await;
+        let targets = self.link_targets.read().await;
 
         let target_instance = match target_instance {
             Some(
@@ -239,7 +177,7 @@ impl wrpc_transport::Invoke for Handler {
         }).map_err(Error::LinkNotFound)?;
 
         let mut headers = injector_to_headers(&TraceContextInjector::default_with_span());
-        headers.insert("source-id", &*self.component_id);
+        headers.insert("source-id", self.component_id.as_str());
         headers.insert("link-name", link_name);
         let nats = wrpc_transport_nats::Client::new(
             Arc::clone(&self.nats),
@@ -264,9 +202,8 @@ impl Config for Handler {
         &self,
         key: &str,
     ) -> anyhow::Result<Result<Option<String>, capability::config::store::Error>> {
-        let lock = self.config_data.read().await;
-        let conf = lock.get_config().await;
-        let data = conf.get(key).cloned();
+        let lock = self.wasi_config.read().await;
+        let data = lock.get(key).cloned();
         Ok(Ok(data))
     }
 
@@ -275,13 +212,11 @@ impl Config for Handler {
         &self,
     ) -> anyhow::Result<Result<Vec<(String, String)>, capability::config::store::Error>> {
         Ok(Ok(self
-            .config_data
+            .wasi_config
             .read()
             .await
-            .get_config()
-            .await
-            .clone()
-            .into_iter()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
             .collect()))
     }
 }
@@ -295,62 +230,7 @@ impl Logging for Handler {
         context: String,
         message: String,
     ) -> anyhow::Result<()> {
-        match level {
-            logging::Level::Trace => {
-                tracing::event!(
-                    tracing::Level::TRACE,
-                    component_id = ?self.component_id,
-                    level = level.to_string(),
-                    context,
-                    "{message}"
-                );
-            }
-            logging::Level::Debug => {
-                tracing::event!(
-                    tracing::Level::DEBUG,
-                    component_id = ?self.component_id,
-                    level = level.to_string(),
-                    context,
-                    "{message}"
-                );
-            }
-            logging::Level::Info => {
-                tracing::event!(
-                    tracing::Level::INFO,
-                    component_id = ?self.component_id,
-                    level = level.to_string(),
-                    context,
-                    "{message}"
-                );
-            }
-            logging::Level::Warn => {
-                tracing::event!(
-                    tracing::Level::WARN,
-                    component_id = ?self.component_id,
-                    level = level.to_string(),
-                    context,
-                    "{message}"
-                );
-            }
-            logging::Level::Error => {
-                tracing::event!(
-                    tracing::Level::ERROR,
-                    component_id = ?self.component_id,
-                    level = level.to_string(),
-                    context,
-                    "{message}"
-                );
-            }
-            logging::Level::Critical => {
-                tracing::event!(
-                    tracing::Level::ERROR,
-                    component_id = ?self.component_id,
-                    level = level.to_string(),
-                    context,
-                    "{message}"
-                );
-            }
-        };
+        println!("log: {:?} {:?} {:?}", level, context, message);
         Ok(())
     }
 }
@@ -362,29 +242,18 @@ impl Secrets for Handler {
         &self,
         key: &str,
     ) -> anyhow::Result<Result<secrets::store::Secret, secrets::store::SecretsError>> {
-        if self.secrets.read().await.get(key).is_some() {
-            Ok(Ok(Arc::new(key.to_string())))
-        } else {
-            Ok(Err(secrets::store::SecretsError::NotFound))
-        }
+        Ok(Err(secrets::store::SecretsError::NotFound))
     }
 
     async fn reveal(
         &self,
         secret: secrets::store::Secret,
     ) -> anyhow::Result<secrets::store::SecretValue> {
-        let read_lock = self.secrets.read().await;
-        let Some(secret_val) = read_lock.get(secret.as_str()) else {
-            // NOTE(brooksmtownsend): This error case should never happen, since we check for existence during `get` and
-            // fail to start the component if the secret is missing. We might hit this during wRPC testing with resources.
-            const ERROR_MSG: &str = "secret not found to reveal, ensure the secret is declared and associated with this component at startup";
-            // NOTE: This "secret" is just the name of the key, not the actual secret value. Regardless the secret itself
-            // both wasn't found and is wrapped by `secrecy` so it won't be logged.
-            error!(?secret, ERROR_MSG);
-            bail!(ERROR_MSG)
-        };
-        use secrecy::ExposeSecret;
-        Ok(secret_val.expose_secret().clone())
+        const ERROR_MSG: &str = "secret not found to reveal, ensure the secret is declared and associated with this component at startup";
+        // NOTE: This "secret" is just the name of the key, not the actual secret value. Regardless the secret itself
+        // both wasn't found and is wrapped by `secrecy` so it won't be logged.
+        error!(?secret, ERROR_MSG);
+        bail!(ERROR_MSG)
     }
 }
 
@@ -399,7 +268,7 @@ impl Messaging0_2 for Handler {
         use wasmcloud_runtime::capability::wrpc::wasmcloud::messaging0_2_0 as messaging;
 
         {
-            let targets = self.targets.read().await;
+            let targets = self.link_targets.read().await;
             let target = targets
                 .get("wasmcloud:messaging/consumer")
                 .map(AsRef::as_ref)
@@ -451,7 +320,7 @@ impl Messaging0_2 for Handler {
         use wasmcloud_runtime::capability::wrpc::wasmcloud::messaging0_2_0 as messaging;
 
         {
-            let targets = self.targets.read().await;
+            let targets = self.link_targets.read().await;
             let target = targets
                 .get("wasmcloud:messaging/consumer")
                 .map(AsRef::as_ref)
@@ -639,7 +508,7 @@ impl Messaging0_3 for Handler {
             .downcast_ref()
             .context("unknown client type")?;
         {
-            let targets = self.targets.read().await;
+            let targets = self.link_targets.read().await;
             let target = targets
                 .get("wasmcloud:messaging/producer")
                 .map(AsRef::as_ref)
@@ -794,7 +663,7 @@ impl Messaging0_3 for Handler {
             .downcast_ref()
             .context("unknown client type")?;
         {
-            let targets = self.targets.read().await;
+            let targets = self.link_targets.read().await;
             let target = targets
                 .get("wasmcloud:messaging/request-reply")
                 .map(AsRef::as_ref)
@@ -946,7 +815,7 @@ impl Messaging0_3 for Handler {
         use wasmcloud_runtime::capability::wrpc::wasmcloud::messaging0_2_0 as messaging;
 
         {
-            let targets = self.targets.read().await;
+            let targets = self.link_targets.read().await;
             let target = targets
                 .get("wasmcloud:messaging/request-reply")
                 .map(AsRef::as_ref)
