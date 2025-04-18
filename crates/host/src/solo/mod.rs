@@ -20,7 +20,6 @@ use async_nats::jetstream::kv::Store;
 use bytes::{BufMut, Bytes, BytesMut};
 use claims::{Claims, StoredClaims};
 use cloudevents::{EventBuilder, EventBuilderV10};
-use ctl::ControlInterfaceServer;
 use futures::future::Either;
 use futures::stream::{AbortHandle, Abortable, SelectAll};
 use futures::{join, stream, try_join, Stream, StreamExt, TryFutureExt, TryStreamExt};
@@ -65,7 +64,6 @@ use crate::{
 };
 
 mod claims;
-mod ctl;
 mod event;
 mod experimental;
 mod handler;
@@ -922,13 +920,13 @@ impl Host {
         };
 
         let host = Arc::new(host);
-        let queue = spawn({
+        let control_handling = spawn({
             let host = Arc::clone(&host);
             async move {
                 let mut queue = Abortable::new(mapper, queue_abort_reg);
                 queue
                     .by_ref()
-                    .for_each_concurrent(None, {
+                    .for_each({
                         let host = Arc::clone(&host);
                         move |msg| {
                             let host = Arc::clone(&host);
@@ -950,6 +948,8 @@ impl Host {
             let data = data.clone();
             let host = Arc::clone(&host);
             async move {
+                // TODO(lxf): refactor
+                // Shouldn't be watching all keys ( or any keys at all )
                 let data_watch = data
                     .watch_all()
                     .await
@@ -972,6 +972,7 @@ impl Host {
                         }
                     })
                     .await;
+
                 let deadline = { *host.stop_rx.borrow() };
                 host.stop_tx.send_replace(deadline);
                 if data_watch.is_aborted() {
@@ -1022,22 +1023,24 @@ impl Host {
         });
 
         // Process existing data without emitting events
-        data.keys()
-            .await
-            .context("failed to read keys of lattice data bucket")?
-            .map_err(|e| anyhow!(e).context("failed to read lattice data stream"))
-            .try_filter_map(|key| async {
-                data.entry(key)
-                    .await
-                    .context("failed to get entry in lattice data bucket")
-            })
-            .for_each(|entry| async {
-                match entry {
-                    Ok(entry) => host.process_entry(entry).await,
-                    Err(err) => error!(%err, "failed to read entry from lattice data bucket"),
-                }
-            })
-            .await;
+        // TODO(lxf): refactor
+        // Not sure what happens here
+        // data.keys()
+        //     .await
+        //     .context("failed to read keys of lattice data bucket")?
+        //     .map_err(|e| anyhow!(e).context("failed to read lattice data stream"))
+        //     .try_filter_map(|key| async {
+        //         data.entry(key)
+        //             .await
+        //             .context("failed to get entry in lattice data bucket")
+        //     })
+        //     .for_each(|entry| async {
+        //         match entry {
+        //             Ok(entry) => host.process_entry(entry).await,
+        //             Err(err) => error!(%err, "failed to read entry from lattice data bucket"),
+        //         }
+        //     })
+        //     .await;
 
         host.publish_event("host_started", start_evt)
             .await
@@ -1052,7 +1055,8 @@ impl Host {
             heartbeat_abort.abort();
             queue_abort.abort();
             data_watch_abort.abort();
-            let _ = try_join!(queue, data_watch, heartbeat).context("failed to await tasks")?;
+            let _ = try_join!(control_handling, data_watch, heartbeat)
+                .context("failed to await tasks")?;
             host.publish_event(
                 "host_stopped",
                 json!({
@@ -1448,26 +1452,6 @@ impl Host {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn handle_auction_component(
-        &self,
-        payload: impl AsRef<[u8]>,
-    ) -> anyhow::Result<Option<CtlResponse<ComponentAuctionAck>>> {
-        let request = serde_json::from_slice::<ComponentAuctionRequest>(payload.as_ref())
-            .context("failed to deserialize component auction command")?;
-        <Self as ControlInterfaceServer>::handle_auction_component(self, request).await
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    async fn handle_auction_provider(
-        &self,
-        payload: impl AsRef<[u8]>,
-    ) -> anyhow::Result<Option<CtlResponse<ProviderAuctionAck>>> {
-        let request = serde_json::from_slice::<ProviderAuctionRequest>(payload.as_ref())
-            .context("failed to deserialize provider auction command")?;
-        <Self as ControlInterfaceServer>::handle_auction_provider(self, request).await
-    }
-
-    #[instrument(level = "debug", skip_all)]
     async fn handle_stop_host(
         &self,
         payload: impl AsRef<[u8]>,
@@ -1503,14 +1487,20 @@ impl Host {
         if let Some(timeout) = timeout {
             stop_command = stop_command.timeout(timeout);
         }
-        <Self as ControlInterfaceServer>::handle_stop_host(
-            self,
-            stop_command
-                .build()
-                .map_err(|e| anyhow!(e))
-                .context("failed to build stop host command")?,
-        )
-        .await
+
+        info!(?timeout, "handling stop host");
+
+        self.ready.store(false, Ordering::Relaxed);
+
+        self.heartbeat.abort();
+        self.data_watch.abort();
+        self.queue.abort();
+        let deadline =
+            timeout.and_then(|timeout| Instant::now().checked_add(Duration::from_millis(timeout)));
+        self.stop_tx.send_replace(deadline);
+        Ok(CtlResponse::<()>::success(
+            "successfully handled stop host".into(),
+        ))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1520,7 +1510,155 @@ impl Host {
     ) -> anyhow::Result<CtlResponse<()>> {
         let request = serde_json::from_slice::<ScaleComponentCommand>(payload.as_ref())
             .context("failed to deserialize component scale command")?;
-        <Self as ControlInterfaceServer>::handle_scale_component(self, request).await
+
+        let component_ref = request.component_ref();
+        let component_id = request.component_id();
+        let annotations = request.annotations();
+        let max_instances = request.max_instances();
+        let config = request.config().clone();
+        let allow_update = request.allow_update();
+        let host_id = request.host_id();
+
+        debug!(
+            component_ref,
+            max_instances, component_id, "handling scale component"
+        );
+
+        let host_id = host_id.to_string();
+        let annotations: Annotations = annotations
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        // Basic validation to ensure that the component is running and that the image reference matches
+        // If it doesn't match, we can still successfully scale, but we won't be updating the image reference
+        let (original_ref, ref_changed) = {
+            self.components
+                .read()
+                .await
+                .get(component_id)
+                .map(|v| {
+                    (
+                        Some(Arc::clone(&v.image_reference)),
+                        &*v.image_reference != component_ref,
+                    )
+                })
+                .unwrap_or_else(|| (None, false))
+        };
+
+        let mut perform_post_update: bool = false;
+        let message = match (allow_update, original_ref, ref_changed) {
+            // Updates are not allowed, original ref changed
+            (false, Some(original_ref), true) => {
+                let msg = format!(
+                "Requested to scale existing component to a different image reference: {original_ref} != {component_ref}. The component will be scaled but the image reference will not be updated. If you meant to update this component to a new image ref, use the update command."
+            );
+                warn!(msg);
+                msg
+            }
+            // Updates are allowed, ref changed and we'll do an update later
+            (true, Some(original_ref), true) => {
+                perform_post_update = true;
+                format!(
+                "Requested to scale existing component, with a changed image reference: {original_ref} != {component_ref}. The component will be scaled, and the image reference will be updated afterwards."
+            )
+            }
+            _ => String::with_capacity(0),
+        };
+
+        let component_id = Arc::from(component_id);
+        let component_ref = Arc::from(component_ref);
+        // Spawn a task to perform the scaling and possibly an update of the component afterwards
+        spawn(async move {
+            // Fetch the component from the reference
+            let component_and_claims =
+                self.fetch_component(&component_ref)
+                    .await
+                    .map(|component_bytes| {
+                        // Pull the claims token from the component, this returns an error only if claims are embedded
+                        // and they are invalid (expired, tampered with, etc)
+                        let claims_token =
+                            wasmcloud_runtime::component::claims_token(&component_bytes);
+                        (component_bytes, claims_token)
+                    });
+            let (wasm, claims_token, retrieval_error) = match component_and_claims {
+                Ok((wasm, Ok(claims_token))) => (Some(wasm), claims_token, None),
+                Ok((_, Err(e))) => {
+                    if let Err(e) = self
+                        .publish_event(
+                            "component_scale_failed",
+                            event::component_scale_failed(
+                                None,
+                                &annotations,
+                                host_id,
+                                &component_ref,
+                                &component_id,
+                                max_instances,
+                                &e,
+                            ),
+                        )
+                        .await
+                    {
+                        error!(%component_ref, %component_id, err = ?e, "failed to publish component scale failed event");
+                    }
+                    return;
+                }
+                Err(e) => (None, None, Some(e)),
+            };
+            // Scale the component
+            if let Err(e) = self
+                .handle_scale_component_task(
+                    Arc::clone(&component_ref),
+                    Arc::clone(&component_id),
+                    &host_id,
+                    max_instances,
+                    &annotations,
+                    config,
+                    wasm.ok_or_else(|| {
+                        retrieval_error.unwrap_or_else(|| anyhow!("unexpected missing wasm binary"))
+                    }),
+                    claims_token.as_ref(),
+                )
+                .await
+            {
+                error!(%component_ref, %component_id, err = ?e, "failed to scale component");
+                if let Err(e) = self
+                    .publish_event(
+                        "component_scale_failed",
+                        event::component_scale_failed(
+                            claims_token.map(|c| c.claims).as_ref(),
+                            &annotations,
+                            host_id,
+                            &component_ref,
+                            &component_id,
+                            max_instances,
+                            &e,
+                        ),
+                    )
+                    .await
+                {
+                    error!(%component_ref, %component_id, err = ?e, "failed to publish component scale failed event");
+                }
+                return;
+            }
+
+            if perform_post_update {
+                if let Err(e) = self
+                    .handle_update_component_task(
+                        Arc::clone(&component_id),
+                        Arc::clone(&component_ref),
+                        &host_id,
+                        None,
+                    )
+                    .await
+                {
+                    error!(%component_ref, %component_id, err = ?e, "failed to update component after scale");
+                }
+            }
+        });
+
+        Ok(CtlResponse::<()>::success(message))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1693,19 +1831,6 @@ impl Host {
         Ok(())
     }
 
-    // TODO(#1548): With component IDs, new component references, configuration, etc, we're going to need to do some
-    // design thinking around how update component should work. Should it be limited to a single host or latticewide?
-    // Should it also update configuration, or is that separate? Should scaling be done via an update?
-    #[instrument(level = "debug", skip_all)]
-    async fn handle_update_component(
-        self: Arc<Self>,
-        payload: impl AsRef<[u8]>,
-    ) -> anyhow::Result<CtlResponse<()>> {
-        let cmd = serde_json::from_slice::<UpdateComponentCommand>(payload.as_ref())
-            .context("failed to deserialize component update command")?;
-        <Self as ControlInterfaceServer>::handle_update_component(self, cmd).await
-    }
-
     async fn handle_update_component_task(
         &self,
         component_id: Arc<str>,
@@ -1799,9 +1924,80 @@ impl Host {
         self: Arc<Self>,
         payload: impl AsRef<[u8]>,
     ) -> anyhow::Result<Option<CtlResponse<()>>> {
-        let cmd = serde_json::from_slice::<StartProviderCommand>(payload.as_ref())
+        let request = serde_json::from_slice::<StartProviderCommand>(payload.as_ref())
             .context("failed to deserialize provider start command")?;
-        <Self as ControlInterfaceServer>::handle_start_provider(self, cmd).await
+
+        if self
+            .providers
+            .read()
+            .await
+            .contains_key(request.provider_id())
+        {
+            return Ok(Some(CtlResponse::error(
+                "provider with that ID is already running",
+            )));
+        }
+
+        // Avoid responding to start providers for builtin providers if they're not enabled
+        if let Ok(ResourceRef::Builtin(name)) = ResourceRef::try_from(request.provider_ref()) {
+            if !self.experimental_features.builtin_http_server && name == "http-server" {
+                debug!(
+                    provider_ref = request.provider_ref(),
+                    provider_id = request.provider_id(),
+                    "skipping start provider for disabled builtin http provider"
+                );
+                return Ok(None);
+            }
+            if !self.experimental_features.builtin_messaging_nats && name == "messaging-nats" {
+                debug!(
+                    provider_ref = request.provider_ref(),
+                    provider_id = request.provider_id(),
+                    "skipping start provider for disabled builtin messaging provider"
+                );
+                return Ok(None);
+            }
+        }
+
+        // NOTE: We log at info since starting providers can take a while
+        info!(
+            provider_ref = request.provider_ref(),
+            provider_id = request.provider_id(),
+            "handling start provider"
+        );
+
+        let host_id = request.host_id().to_string();
+        spawn(async move {
+            let config = request.config();
+            let provider_id = request.provider_id();
+            let provider_ref = request.provider_ref();
+            let annotations = request.annotations();
+
+            if let Err(err) = Arc::clone(&self)
+                .handle_start_provider_task(
+                    config,
+                    provider_id,
+                    provider_ref,
+                    annotations.cloned().unwrap_or_default(),
+                    &host_id,
+                )
+                .await
+            {
+                error!(provider_ref, provider_id, ?err, "failed to start provider");
+                if let Err(err) = self
+                    .publish_event(
+                        "provider_start_failed",
+                        event::provider_start_failed(provider_ref, provider_id, host_id, &err),
+                    )
+                    .await
+                {
+                    error!(?err, "failed to publish provider_start_failed event");
+                }
+            }
+        });
+
+        Ok(Some(CtlResponse::<()>::success(
+            "successfully started provider".into(),
+        )))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1945,104 +2141,107 @@ impl Host {
         &self,
         payload: impl AsRef<[u8]>,
     ) -> anyhow::Result<CtlResponse<()>> {
-        let cmd = serde_json::from_slice::<StopProviderCommand>(payload.as_ref())
+        let request = serde_json::from_slice::<StopProviderCommand>(payload.as_ref())
             .context("failed to deserialize provider stop command")?;
-        <Self as ControlInterfaceServer>::handle_stop_provider(self, cmd).await
+
+        let provider_id = request.provider_id();
+        let host_id = request.host_id();
+
+        debug!(provider_id, "handling stop provider");
+
+        let mut providers = self.providers.write().await;
+        let hash_map::Entry::Occupied(entry) = providers.entry(provider_id.into()) else {
+            warn!(
+                provider_id,
+                "received request to stop provider that is not running"
+            );
+            return Ok(CtlResponse::error("provider with that ID is not running"));
+        };
+        let Provider {
+            ref annotations,
+            mut tasks,
+            shutdown,
+            ..
+        } = entry.remove();
+
+        // Set the shutdown flag to true to stop health checks and config updates. Also
+        // prevents restarting the provider but does not stop the provider process.
+        shutdown.store(true, Ordering::Relaxed);
+
+        // Send a request to the provider, requesting a graceful shutdown
+        let req = serde_json::to_vec(&json!({ "host_id": host_id }))
+            .context("failed to encode provider stop request")?;
+        let req = async_nats::Request::new()
+            .payload(req.into())
+            .timeout(self.host_config.provider_shutdown_delay)
+            .headers(injector_to_headers(
+                &TraceContextInjector::default_with_span(),
+            ));
+        if let Err(e) = self
+            .rpc_nats
+            .send_request(
+                format!(
+                    "wasmbus.rpc.{}.{provider_id}.default.shutdown",
+                    self.host_config.lattice
+                ),
+                req,
+            )
+            .await
+        {
+            warn!(
+                ?e,
+                provider_id,
+                "provider did not gracefully shut down in time, shutting down forcefully"
+            );
+            // NOTE: The provider child process is spawned with [tokio::process::Command::kill_on_drop],
+            // so dropping the task will send a SIGKILL to the provider process.
+        }
+
+        // Stop the provider and health check / config changes tasks
+        tasks.abort_all();
+
+        info!(provider_id, "provider stopped");
+        self.publish_event(
+            "provider_stopped",
+            event::provider_stopped(annotations, host_id, provider_id, "stop"),
+        )
+        .await?;
+        Ok(CtlResponse::<()>::success(
+            "successfully stopped provider".into(),
+        ))
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn handle_inventory(&self) -> anyhow::Result<CtlResponse<HostInventory>> {
-        <Self as ControlInterfaceServer>::handle_inventory(self).await
-    }
-
-    #[instrument(level = "trace", skip_all)]
-    async fn handle_claims(&self) -> anyhow::Result<CtlResponse<Vec<HashMap<String, String>>>> {
-        <Self as ControlInterfaceServer>::handle_claims(self).await
-    }
-
-    #[instrument(level = "trace", skip_all)]
-    async fn handle_links(&self) -> anyhow::Result<Vec<u8>> {
-        <Self as ControlInterfaceServer>::handle_links(self).await
-    }
-
-    #[instrument(level = "trace", skip(self))]
-    async fn handle_config_get(&self, config_name: &str) -> anyhow::Result<Vec<u8>> {
-        <Self as ControlInterfaceServer>::handle_config_get(self, config_name).await
+    async fn handle_component_list(&self) -> anyhow::Result<CtlResponse<HostInventory>> {
+        let inventory = self.inventory().await;
+        Ok(CtlResponse::ok(inventory))
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn handle_label_put(
-        &self,
-        host_id: &str,
-        payload: impl AsRef<[u8]>,
-    ) -> anyhow::Result<CtlResponse<()>> {
-        let host_label = serde_json::from_slice::<HostLabel>(payload.as_ref())
-            .context("failed to deserialize put label request")?;
-        <Self as ControlInterfaceServer>::handle_label_put(self, host_label, host_id).await
-    }
+    async fn handle_ping(&self) -> anyhow::Result<CtlResponse<wasmcloud_control_interface::Host>> {
+        trace!("replying to ping");
+        let uptime = self.start_at.elapsed();
 
-    #[instrument(level = "debug", skip_all)]
-    async fn handle_label_del(
-        &self,
-        host_id: &str,
-        payload: impl AsRef<[u8]>,
-    ) -> anyhow::Result<CtlResponse<()>> {
-        let label = serde_json::from_slice::<HostLabelIdentifier>(payload.as_ref())
-            .context("failed to deserialize delete label request")?;
-        <Self as ControlInterfaceServer>::handle_label_del(self, label, host_id).await
-    }
+        let mut host = wasmcloud_control_interface::Host::builder()
+            .id(self.host_key.public_key())
+            .labels(self.labels.read().await.clone())
+            .friendly_name(self.friendly_name.clone())
+            .uptime_seconds(uptime.as_secs())
+            .uptime_human(human_friendly_uptime(uptime))
+            .version(self.host_config.version.clone())
+            .ctl_host(self.host_config.ctl_nats_url.to_string())
+            .rpc_host(self.host_config.rpc_nats_url.to_string())
+            .lattice(self.host_config.lattice.to_string());
 
-    /// Handle a new link by modifying the relevant source [ComponentSpecification]. Once
-    /// the change is written to the LATTICEDATA store, each host in the lattice (including this one)
-    /// will handle the new specification and update their own internal link maps via [process_component_spec_put].
-    #[instrument(level = "debug", skip_all)]
-    async fn handle_link_put(&self, payload: impl AsRef<[u8]>) -> anyhow::Result<CtlResponse<()>> {
-        let link: Link = serde_json::from_slice(payload.as_ref())
-            .context("failed to deserialize wrpc link definition")?;
-        <Self as ControlInterfaceServer>::handle_link_put(self, link).await
-    }
+        if let Some(ref js_domain) = self.host_config.js_domain {
+            host = host.js_domain(js_domain.clone());
+        }
 
-    #[instrument(level = "debug", skip_all)]
-    /// Remove an interface link on a source component for a specific package
-    async fn handle_link_del(&self, payload: impl AsRef<[u8]>) -> anyhow::Result<CtlResponse<()>> {
-        let req = serde_json::from_slice::<DeleteInterfaceLinkDefinitionRequest>(payload.as_ref())
-            .context("failed to deserialize wrpc link definition")?;
-        <Self as ControlInterfaceServer>::handle_link_del(self, req).await
-    }
+        let host = host
+            .build()
+            .map_err(|e| anyhow!("failed to build host message: {e}"))?;
 
-    #[instrument(level = "debug", skip_all)]
-    async fn handle_registries_put(
-        &self,
-        payload: impl AsRef<[u8]>,
-    ) -> anyhow::Result<CtlResponse<()>> {
-        let registry_creds: HashMap<String, RegistryCredential> =
-            serde_json::from_slice(payload.as_ref())
-                .context("failed to deserialize registries put command")?;
-        <Self as ControlInterfaceServer>::handle_registries_put(self, registry_creds).await
-    }
-
-    #[instrument(level = "debug", skip_all, fields(%config_name))]
-    async fn handle_config_put(
-        &self,
-        config_name: &str,
-        data: Bytes,
-    ) -> anyhow::Result<CtlResponse<()>> {
-        // Validate that the data is of the proper type by deserialing it
-        serde_json::from_slice::<HashMap<String, String>>(&data)
-            .context("config data should be a map of string -> string")?;
-        <Self as ControlInterfaceServer>::handle_config_put(self, config_name, data).await
-    }
-
-    #[instrument(level = "debug", skip_all, fields(%config_name))]
-    async fn handle_config_delete(&self, config_name: &str) -> anyhow::Result<CtlResponse<()>> {
-        <Self as ControlInterfaceServer>::handle_config_delete(self, config_name).await
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    async fn handle_ping_hosts(
-        &self,
-    ) -> anyhow::Result<CtlResponse<wasmcloud_control_interface::Host>> {
-        <Self as ControlInterfaceServer>::handle_ping_hosts(self).await
+        Ok(CtlResponse::ok(host))
     }
 
     #[instrument(level = "trace", skip_all, fields(subject = %message.subject))]
@@ -2072,25 +2271,12 @@ impl Host {
         // And finally, the Vec<u8> is the serialized [CtlResponse] that we'll send back to the client
         let ctl_response = match (parts.next(), parts.next(), parts.next(), parts.next()) {
             // Component commands
-            (Some("component"), Some("auction"), None, None) => self
-                .handle_auction_component(message.payload)
-                .await
-                .map(serialize_ctl_response),
             (Some("component"), Some("scale"), Some(_host_id), None) => Arc::clone(&self)
                 .handle_scale_component(message.payload)
                 .await
                 .map(Some)
                 .map(serialize_ctl_response),
-            (Some("component"), Some("update"), Some(_host_id), None) => Arc::clone(&self)
-                .handle_update_component(message.payload)
-                .await
-                .map(Some)
-                .map(serialize_ctl_response),
             // Provider commands
-            (Some("provider"), Some("auction"), None, None) => self
-                .handle_auction_provider(message.payload)
-                .await
-                .map(serialize_ctl_response),
             (Some("provider"), Some("start"), Some(_host_id), None) => Arc::clone(&self)
                 .handle_start_provider(message.payload)
                 .await
@@ -2101,75 +2287,21 @@ impl Host {
                 .map(Some)
                 .map(serialize_ctl_response),
             // Host commands
-            (Some("host"), Some("get"), Some(_host_id), None) => self
-                .handle_inventory()
+            (Some("component"), Some("list"), None, None) => self
+                .handle_component_list()
                 .await
                 .map(Some)
                 .map(serialize_ctl_response),
-            (Some("host"), Some("ping"), None, None) => self
-                .handle_ping_hosts()
+            (Some("ping"), None, None, None) => self
+                .handle_ping()
                 .await
                 .map(Some)
                 .map(serialize_ctl_response),
-            (Some("host"), Some("stop"), Some(host_id), None) => self
-                .handle_stop_host(message.payload, host_id)
+            (Some("shutdown"), None, None, None) => self
+                .handle_stop_host(message.payload, self.host_key.public_key().as_str())
                 .await
                 .map(Some)
                 .map(serialize_ctl_response),
-            // Claims commands
-            (Some("claims"), Some("get"), None, None) => self
-                .handle_claims()
-                .await
-                .map(Some)
-                .map(serialize_ctl_response),
-            // Link commands
-            (Some("link"), Some("del"), None, None) => self
-                .handle_link_del(message.payload)
-                .await
-                .map(Some)
-                .map(serialize_ctl_response),
-            (Some("link"), Some("get"), None, None) => {
-                // Explicitly returning a Vec<u8> for non-cloning efficiency within handle_links
-                self.handle_links().await.map(|bytes| Some(Ok(bytes)))
-            }
-            (Some("link"), Some("put"), None, None) => self
-                .handle_link_put(message.payload)
-                .await
-                .map(Some)
-                .map(serialize_ctl_response),
-            // Label commands
-            (Some("label"), Some("del"), Some(host_id), None) => self
-                .handle_label_del(host_id, message.payload)
-                .await
-                .map(Some)
-                .map(serialize_ctl_response),
-            (Some("label"), Some("put"), Some(host_id), None) => self
-                .handle_label_put(host_id, message.payload)
-                .await
-                .map(Some)
-                .map(serialize_ctl_response),
-            // Registry commands
-            (Some("registry"), Some("put"), None, None) => self
-                .handle_registries_put(message.payload)
-                .await
-                .map(Some)
-                .map(serialize_ctl_response),
-            // Config commands
-            (Some("config"), Some("get"), Some(config_name), None) => self
-                .handle_config_get(config_name)
-                .await
-                .map(|bytes| Some(Ok(bytes))),
-            (Some("config"), Some("put"), Some(config_name), None) => self
-                .handle_config_put(config_name, message.payload)
-                .await
-                .map(Some)
-                .map(serialize_ctl_response),
-            (Some("config"), Some("del"), Some(config_name), None) => self
-                .handle_config_delete(config_name)
-                .await
-                .map(Some)
-                .map(serialize_ctl_response),
-            // Topic fallback
             _ => {
                 warn!(%subject, "received control interface request on unsupported subject");
                 Ok(serialize_ctl_response(Some(CtlResponse::error(
