@@ -3,6 +3,9 @@
 #![warn(missing_docs)]
 #![forbid(clippy::unwrap_used)]
 
+/// solo host
+pub mod solo;
+
 /// wasmbus host
 pub mod wasmbus;
 
