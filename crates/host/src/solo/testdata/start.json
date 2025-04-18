@@ -1,7 +1,7 @@
 {
   "namespace": "default",
   "name": "test",
-  "image": "ghcr.io/wasmcloud/components/http-hello-world-rust:0.1.0",
+  "image": "file:///Users/lucas/code/src/github.com/wasmCloud/wasmCloud/crates/host/src/solo/testdata/server.wasm",
   "concurrency": 1,
   "annotations": {
     "key": "value"

@@ -50,7 +50,7 @@ pub struct Handler {
     /// The lattice this handler will use for RPC
     pub lattice: Arc<String>,
     /// The identifier of the component that this handler is associated with
-    pub component_id: Arc<String>,
+    pub wrpc_id: Arc<String>,
 
     pub link_targets: Arc<RwLock<LinkTargets>>,
     #[allow(clippy::type_complexity)]
@@ -75,7 +75,7 @@ impl Handler {
             nats: self.nats.clone(),
             wasi_config: self.wasi_config.clone(),
             lattice: self.lattice.clone(),
-            component_id: self.component_id.clone(),
+            wrpc_id: self.wrpc_id.clone(),
             link_targets: Arc::default(),
             link_instances: self.link_instances.clone(),
             messaging_links: self.messaging_links.clone(),
@@ -158,7 +158,7 @@ impl wrpc_transport::Invoke for Handler {
                     instance,
                     link_name,
                     ?target_instance,
-                    ?self.component_id,
+                    ?self.wrpc_id,
                     "no links with link name found for instance"
                 );
                 format!("link `{link_name}` not found for instance `{target_instance}`")
@@ -170,14 +170,14 @@ impl wrpc_transport::Invoke for Handler {
             warn!(
                 instance,
                 ?target_instance,
-                ?self.component_id,
+                ?self.wrpc_id,
                 "component is not linked to a lattice target for the given instance"
             );
-            format!("failed to call `{func}` in instance `{instance}` (failed to find a configured link with name `{link_name}` from component `{id}`, please check your configuration)", id = self.component_id)
+            format!("failed to call `{func}` in instance `{instance}` (failed to find a configured link with name `{link_name}` from component `{id}`, please check your configuration)", id = self.wrpc_id)
         }).map_err(Error::LinkNotFound)?;
 
         let mut headers = injector_to_headers(&TraceContextInjector::default_with_span());
-        headers.insert("source-id", self.component_id.as_str());
+        headers.insert("source-id", self.wrpc_id.as_str());
         headers.insert("link-name", link_name);
         let nats = wrpc_transport_nats::Client::new(
             Arc::clone(&self.nats),
@@ -1030,7 +1030,7 @@ impl Identity for Handler {
         // "wasmcloud", "component:{component_id}" is inserted at the end to make sure it can't be overridden.
         selectors.push(Selector::Generic((
             WASMCLOUD_SELECTOR_TYPE.to_string(),
-            format!("{}:{}", WASMCLOUD_SELECTOR_COMPONENT, self.component_id),
+            format!("{}:{}", WASMCLOUD_SELECTOR_COMPONENT, self.wrpc_id),
         )));
 
         let svids = match client

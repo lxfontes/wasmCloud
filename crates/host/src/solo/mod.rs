@@ -1191,7 +1191,7 @@ impl Host {
             "instantiating component"
         );
 
-        let wrpc_id = Arc::clone(&handler.component_id);
+        let wrpc_id = Arc::clone(&handler.wrpc_id);
 
         let max_execution_time = self.max_execution_time;
         component.set_max_execution_time(max_execution_time);
@@ -1341,7 +1341,7 @@ impl Host {
             nats: Arc::clone(&self.rpc_nats),
             wasi_config: Arc::new(RwLock::new(config)),
             lattice: Arc::clone(&lattice),
-            component_id: Arc::clone(&wrpc_id),
+            wrpc_id: Arc::clone(&wrpc_id),
             link_targets: Arc::default(),
             link_instances: Arc::new(RwLock::new(component_import_links(&links))),
             messaging_links: Arc::default(),
@@ -1380,7 +1380,7 @@ impl Host {
         let registry_config = self.registry_config.read().await;
         fetch_component(
             component_ref,
-            self.host_config.allow_file_load,
+            true,
             &self.host_config.oci_opts.additional_ca_paths,
             &registry_config,
         )
@@ -1473,12 +1473,17 @@ impl Host {
         let claims = claims_token.map(|c| c.claims.clone());
         let links = Vec::<Link>::default();
 
+        let wrpc_id = Arc::new(format!(
+            "{}.{}",
+            request.payload.namespace, request.payload.name
+        ));
+
         let component = self
             .start_component(
                 component_bytes.as_ref(),
                 claims.clone(),
                 Arc::new(component_ref.to_string()),
-                Arc::new(component_id.to_string()),
+                wrpc_id,
                 max_instances,
                 &annotations,
                 wasi_config,
@@ -1596,7 +1601,7 @@ impl Host {
                 let (path, claims_token) = crate::fetch_provider(
                     &provider_ref,
                     host_id,
-                    self.host_config.allow_file_load,
+                    true,
                     &self.host_config.oci_opts.additional_ca_paths,
                     &registry_config,
                 )

@@ -85,30 +85,26 @@ impl Host {
             .filter(|link| link.source_id() == provider_id || link.target() == provider_id);
         let link_definitions = stream::iter(provider_links)
             .filter_map(|link| async {
-                if link.source_id() == provider_id || link.target() == provider_id {
-                    match self
-                        .resolve_link_config(
-                            link.clone(),
-                            claims_token.as_ref().map(|t| &t.jwt),
-                            annotations.get("wasmcloud.dev/appspec"),
-                            &xkey,
-                        )
-                        .await
-                    {
-                        Ok(provider_link) => Some(provider_link),
-                        Err(e) => {
-                            error!(
-                                error = ?e,
-                                provider_id,
-                                source_id = link.source_id(),
-                                target = link.target(),
-                                "failed to resolve link config, skipping link"
-                            );
-                            None
-                        }
+                match self
+                    .resolve_link_config(
+                        link.clone(),
+                        claims_token.as_ref().map(|t| &t.jwt),
+                        annotations.get("wasmcloud.dev/appspec"),
+                        &xkey,
+                    )
+                    .await
+                {
+                    Ok(provider_link) => Some(provider_link),
+                    Err(e) => {
+                        error!(
+                            error = ?e,
+                            provider_id,
+                            source_id = link.source_id(),
+                            target = link.target(),
+                            "failed to resolve link config, skipping link"
+                        );
+                        None
                     }
-                } else {
-                    None
                 }
             })
             .collect::<Vec<wasmcloud_core::InterfaceLinkDefinition>>()
