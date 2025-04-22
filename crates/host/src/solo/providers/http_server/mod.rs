@@ -51,7 +51,7 @@ impl crate::solo::Host {
                 components: Arc::clone(&self.components),
                 links: Mutex::default(),
                 host_id: Arc::from(host_id.as_str()),
-                lattice_id: Arc::clone(&self.host_config.lattice),
+                lattice_id: Arc::clone(&self.host_config.domain),
             }),
             // Run provider in path mode
             Some("path") => HttpServerProvider::Path(
@@ -59,7 +59,7 @@ impl crate::solo::Host {
                     default_address,
                     Arc::clone(&self.components),
                     Arc::from(host_id.as_str()),
-                    Arc::clone(&self.host_config.lattice),
+                    Arc::clone(&self.host_config.domain),
                 )
                 .await?,
             ),
@@ -68,7 +68,7 @@ impl crate::solo::Host {
                     default_address,
                     Arc::clone(&self.components),
                     Arc::from(host_id.as_str()),
-                    Arc::clone(&self.host_config.lattice),
+                    Arc::clone(&self.host_config.domain),
                     host_data.config.get("header").cloned(),
                 )
                 .await?,
@@ -80,7 +80,7 @@ impl crate::solo::Host {
         let commands = ProviderCommandReceivers::new(
             Arc::clone(&self.rpc_nats),
             &quit_tx,
-            &self.host_config.lattice,
+            &self.host_config.domain,
             provider_id,
             provider_id,
             &host_id,
@@ -92,7 +92,7 @@ impl crate::solo::Host {
         let conn = ProviderConnection::new(
             Arc::clone(&self.rpc_nats),
             Arc::from(provider_id),
-            Arc::clone(&self.host_config.lattice),
+            Arc::clone(&self.host_config.domain),
             host_id.to_string(),
             host_data.config,
             provider_xkey,

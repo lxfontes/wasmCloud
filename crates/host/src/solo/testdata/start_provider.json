@@ -1,0 +1,22 @@
+{
+  "namespace": "default",
+  "name": "http",
+  "image": "ghcr.io/wasmcloud/http-server:0.27.0",
+  "annotations": {
+    "key": "value"
+  },
+  "config": {
+    "default_address": "0.0.0.0:7070"
+  },
+  "imports": [
+    {
+      "target": {
+        "namespace": "default",
+        "name": "test"
+      },
+      "wit_namespace": "wasi",
+      "wit_package": "http",
+      "interfaces": ["incoming-handler"]
+    }
+  ]
+}

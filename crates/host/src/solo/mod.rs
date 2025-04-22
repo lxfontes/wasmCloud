@@ -18,11 +18,10 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, ensure, Context as _};
 use async_nats::jetstream::kv::Store;
 use bytes::{BufMut, Bytes, BytesMut};
-use claims::{Claims, StoredClaims};
+use claims::Claims;
 use cloudevents::{EventBuilder, EventBuilderV10};
-use futures::future::Either;
 use futures::stream::{AbortHandle, Abortable, SelectAll};
-use futures::{join, stream, try_join, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{join, stream, try_join, Stream, StreamExt, TryStreamExt};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use nkeys::{KeyPair, KeyPairType, XKey};
 use providers::Provider;
@@ -41,13 +40,10 @@ use tracing::{debug, debug_span, error, info, instrument, trace, warn, Instrumen
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use wascap::jwt;
 use wasmcloud_control_interface::{
-    ComponentAuctionAck, ComponentAuctionRequest, ComponentDescription, CtlResponse,
-    DeleteInterfaceLinkDefinitionRequest, HostInventory, HostLabel, HostLabelIdentifier, Link,
-    ProviderAuctionAck, ProviderAuctionRequest, ProviderDescription, RegistryCredential,
-    ScaleComponentCommand, StartProviderCommand, StopHostCommand, StopProviderCommand,
-    UpdateComponentCommand,
+    ComponentDescription, CtlResponse, HostInventory, Link, ProviderDescription,
+    RegistryCredential, StopProviderCommand,
 };
-use wasmcloud_core::{ComponentId, CTL_API_VERSION_1};
+use wasmcloud_core::{ComponentId, InterfaceLinkDefinition};
 use wasmcloud_runtime::capability::secrets::store::SecretValue;
 use wasmcloud_runtime::component::WrpcServeEvent;
 use wasmcloud_runtime::Runtime;
@@ -59,8 +55,8 @@ use crate::registry::RegistryCredentialExt;
 use crate::solo::jetstream::create_bucket;
 use crate::workload_identity::WorkloadIdentityConfig;
 use crate::{
-    fetch_component, HostMetrics, OciConfig, PolicyHostInfo, PolicyManager, PolicyResponse,
-    RegistryAuth, RegistryConfig, RegistryType, ResourceRef, SecretsManager,
+    fetch_component, HostMetrics, OciConfig, RegistryAuth, RegistryConfig, RegistryType,
+    ResourceRef,
 };
 
 pub mod api;
@@ -79,11 +75,11 @@ pub use self::experimental::Features;
 pub use self::host_config::Host as HostConfig;
 pub use jetstream::ComponentSpecification;
 
-use self::config::{BundleGenerator, ConfigBundle};
+use self::config::ConfigBundle;
 use self::handler::Handler;
 
-const MAX_INVOCATION_CHANNEL_SIZE: usize = 5000;
-const MIN_INVOCATION_CHANNEL_SIZE: usize = 256;
+const MAX_INVOCATION_CHANNEL_SIZE: usize = 100;
+const MIN_INVOCATION_CHANNEL_SIZE: usize = 10;
 
 #[derive(Debug)]
 struct ControlMapper {
@@ -162,7 +158,7 @@ impl ControlMapper {
     }
 }
 
-type Annotations = BTreeMap<String, String>;
+type SimpleMap = BTreeMap<String, String>;
 
 #[derive(Debug)]
 struct Component {
@@ -170,7 +166,7 @@ struct Component {
     wrpc_id: Arc<String>,
     handler: Handler,
     exports: JoinHandle<()>,
-    annotations: Annotations,
+    annotations: SimpleMap,
     /// Maximum number of instances of this component that can be running at once
     max_instances: NonZeroUsize,
     image: Arc<String>,
@@ -192,7 +188,7 @@ struct WrpcServer {
     claims: Option<Arc<jwt::Claims<jwt::Component>>>,
     id: Arc<String>,
     image_reference: Arc<String>,
-    annotations: Arc<Annotations>,
+    annotations: Arc<SimpleMap>,
     metrics: Arc<HostMetrics>,
 }
 
@@ -668,7 +664,7 @@ impl Host {
                 let mapper = ControlMapper::new(
                     &ctl_nats,
                     &config.ctl_topic_prefix,
-                    &config.lattice,
+                    &config.domain,
                     &host_key,
                     config.enable_component_auction,
                     config.enable_provider_auction,
@@ -724,7 +720,7 @@ impl Host {
         } else {
             async_nats::jetstream::new(ctl_nats.clone())
         };
-        let bucket = format!("LATTICEDATA_{}", config.lattice);
+        let bucket = format!("LATTICEDATA_{}", config.domain);
         let data = create_bucket(&ctl_jetstream, &bucket).await?;
 
         let (queue_abort, queue_abort_reg) = AbortHandle::new_pair();
@@ -732,7 +728,7 @@ impl Host {
         let (data_watch_abort, data_watch_abort_reg) = AbortHandle::new_pair();
 
         let supplemental_config = if config.config_service_enabled {
-            load_supplemental_config(&ctl_nats, &config.lattice, &labels).await?
+            load_supplemental_config(&ctl_nats, &config.domain, &labels).await?
         } else {
             SupplementalConfig::default()
         };
@@ -772,7 +768,7 @@ impl Host {
         let metrics = HostMetrics::new(
             &meter,
             host_key.public_key(),
-            config.lattice.to_string(),
+            config.domain.to_string(),
             None,
         )
         .context("failed to create HostMetrics instance")?;
@@ -1167,7 +1163,7 @@ impl Host {
         event::publish(
             &self.event_builder,
             &self.ctl_nats,
-            &self.host_config.lattice,
+            &self.host_config.domain,
             name,
             data,
         )
@@ -1179,7 +1175,7 @@ impl Host {
     #[instrument(level = "debug", skip_all)]
     async fn instantiate_component(
         &self,
-        annotations: &Annotations,
+        annotations: &SimpleMap,
         image: Arc<String>,
         max_instances: NonZeroUsize,
         mut component: wasmcloud_runtime::Component<Handler>,
@@ -1201,7 +1197,7 @@ impl Host {
                 .get()
                 .clamp(MIN_INVOCATION_CHANNEL_SIZE, MAX_INVOCATION_CHANNEL_SIZE),
         );
-        let prefix = Arc::from(format!("{}.{wrpc_id}", &self.host_config.lattice));
+        let prefix = Arc::from(format!("{}.component.{wrpc_id}", &self.host_config.domain));
         let nats = wrpc_transport_nats::Client::new(
             Arc::clone(&self.rpc_nats),
             Arc::clone(&prefix),
@@ -1322,8 +1318,8 @@ impl Host {
         image: Arc<String>,
         wrpc_id: Arc<String>,
         max_instances: NonZeroUsize,
-        annotations: &Annotations,
-        config: BTreeMap<String, String>,
+        annotations: &SimpleMap,
+        config: HashMap<String, String>,
         links: Vec<Link>,
     ) -> anyhow::Result<Arc<Component>> {
         debug!(?image, ?max_instances, "starting new component");
@@ -1334,7 +1330,7 @@ impl Host {
                 .context("failed to store claims")?;
         }
 
-        let lattice = Arc::new(self.host_config.lattice.to_string());
+        let lattice = Arc::new(self.host_config.domain.to_string());
 
         // Map the imports to pull out the result types of the functions for lookup when invoking them
         let handler = Handler {
@@ -1455,14 +1451,8 @@ impl Host {
             Some(max_instances) => max_instances,
             None => return Err(anyhow::anyhow!("concurrency must be greater than 0")),
         };
-        let wasi_config = request.payload.wasi_config.unwrap_or_default();
-        let annotations: Annotations = request
-            .payload
-            .annotations
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let wasi_config = request.payload.wasi_config;
+        let annotations: SimpleMap = request.payload.annotations.clone().into_iter().collect();
 
         // Fetch the component from the reference
         let component_bytes = self.fetch_component(&component_ref).await?;
@@ -1541,35 +1531,32 @@ impl Host {
             "handling start provider"
         );
 
-        let host_key = self.host_key.public_key();
-        let host_id = host_key.to_string();
-        spawn(async move {
-            // let config = request.config();
-            // let provider_id = request.provider_id();
-            // let provider_ref = request.provider_ref();
-            // let annotations = request.annotations();
+        let namespace = request.payload.namespace.clone();
+        let name = request.payload.name.clone();
+        let provider_id = format!("capability.{}.{}", namespace, name);
 
-            // if let Err(err) = Arc::clone(&self)
-            //     .handle_start_provider_task(
-            //         config,
-            //         provider_id,
-            //         provider_ref,
-            //         annotations.cloned().unwrap_or_default(),
-            //     )
-            //     .await
-            // {
-            //     error!(provider_ref, provider_id, ?err, "failed to start provider");
-            //     if let Err(err) = self
-            //         .publish_event(
-            //             "provider_start_failed",
-            //             event::provider_start_failed(provider_ref, provider_id, host_id, &err),
-            //         )
-            //         .await
-            //     {
-            //         error!(?err, "failed to publish provider_start_failed event");
-            //     }
-            // }
-        });
+        let links: Vec<InterfaceLinkDefinition> = request
+            .payload
+            .imports
+            .iter()
+            .map(|link| link.as_import(namespace.clone(), name.clone(), true))
+            .collect();
+        println!("links: {:?}", links);
+
+        if let Err(err) = Arc::clone(&self)
+            .handle_start_provider_task(
+                &request.payload.config,
+                &provider_id,
+                &request.payload.image,
+                &request.payload.annotations,
+                &links,
+            )
+            .await
+        {
+            error!(provider_id, ?err, "failed to start provider");
+            return api::Response::error_with_message("failed to start provider".to_string(), ())
+                .serialize();
+        }
 
         api::Response::success_with_message(
             "successfully started provider".to_string(),
@@ -1581,10 +1568,11 @@ impl Host {
     #[instrument(level = "debug", skip_all)]
     async fn handle_start_provider_task(
         self: Arc<Self>,
-        config_names: &[String],
+        config: &HashMap<String, String>,
         provider_id: &str,
         image: &str,
-        annotations: BTreeMap<String, String>,
+        annotations: &HashMap<String, String>,
+        imports: &Vec<InterfaceLinkDefinition>,
     ) -> anyhow::Result<()> {
         trace!(image, provider_id, "start provider task");
 
@@ -1618,8 +1606,6 @@ impl Host {
                 .context("failed to store claims")?;
         }
 
-        let annotations: Annotations = annotations.into_iter().collect();
-
         let mut providers = self.providers.write().await;
         if let hash_map::Entry::Vacant(entry) = providers.entry(provider_id.into()) {
             let provider_xkey = XKey::new();
@@ -1627,32 +1613,28 @@ impl Host {
             let xkey = XKey::from_public_key(&provider_xkey.public_key())
                 .context("failed to create XKey from provider public key xkey")?;
             // Generate the HostData and ConfigBundle for the provider
-            let (host_data, config_bundle) = self
+            let host_data = self
                 .prepare_provider_config(
-                    config_names,
+                    config,
                     claims_token.as_ref(),
                     provider_id,
                     &provider_xkey,
-                    &annotations,
+                    &imports,
+                    annotations,
                 )
                 .await?;
-            let config_bundle = Arc::new(RwLock::new(config_bundle));
-            // Used by provider child tasks (health check, config watch, process restarter) to
-            // know when to shutdown.
+
+            println!("host_data: {:?}", host_data);
+
             let shutdown = Arc::new(AtomicBool::new(false));
             let tasks = match (path, &provider_ref) {
                 (Some(path), ..) => {
                     Arc::clone(&self)
-                        .start_binary_provider(
+                        .start_wrpc_nats_provider(
                             path,
                             host_data,
-                            Arc::clone(&config_bundle),
                             provider_xkey,
                             provider_id,
-                            // Arguments to allow regenerating configuration later
-                            config_names.to_vec(),
-                            claims_token.clone(),
-                            annotations.clone(),
                             shutdown.clone(),
                         )
                         .await?
@@ -1685,7 +1667,7 @@ impl Host {
             // Add the provider
             entry.insert(Provider {
                 tasks,
-                annotations,
+                annotations: annotations.clone().into_iter().collect(),
                 claims_token,
                 image_ref: provider_ref.as_ref().to_string(),
                 xkey,
@@ -1744,7 +1726,7 @@ impl Host {
             .send_request(
                 format!(
                     "wasmbus.rpc.{}.{provider_id}.default.shutdown",
-                    self.host_config.lattice
+                    self.host_config.domain
                 ),
                 req,
             )
@@ -1793,7 +1775,7 @@ impl Host {
             .version(self.host_config.version.clone())
             .ctl_host(self.host_config.ctl_nats_url.to_string())
             .rpc_host(self.host_config.rpc_nats_url.to_string())
-            .lattice(self.host_config.lattice.to_string());
+            .lattice(self.host_config.domain.to_string());
 
         if let Some(ref js_domain) = self.host_config.js_domain {
             host = host.js_domain(js_domain.clone());
@@ -1917,7 +1899,7 @@ impl Host {
             .resolve_link_config(link.clone(), None, None, &XKey::new())
             .await
             .context("failed to resolve link config")?;
-        let lattice = &self.host_config.lattice;
+        let lattice = &self.host_config.domain;
         let payload: Bytes = serde_json::to_vec(&provider_link)
             .context("failed to serialize provider link definition")?
             .into();
@@ -1967,7 +1949,7 @@ impl Host {
             )
             .await
             .context("failed to resolve link config and secrets")?;
-        let lattice = &self.host_config.lattice;
+        let lattice = &self.host_config.domain;
         let payload: Bytes = serde_json::to_vec(&provider_link)
             .context("failed to serialize provider link definition")?
             .into();
@@ -1991,7 +1973,7 @@ impl Host {
     /// is linked to a provider (which it should never be.)
     #[instrument(level = "debug", skip(self))]
     async fn del_provider_link(&self, link: &Link) -> anyhow::Result<()> {
-        let lattice = &self.host_config.lattice;
+        let lattice = &self.host_config.domain;
         // The provider expects the [`wasmcloud_core::InterfaceLinkDefinition`]
         let link = wasmcloud_core::InterfaceLinkDefinition {
             source_id: link.source_id().to_string(),

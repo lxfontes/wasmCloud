@@ -514,7 +514,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let (host, shutdown) = Box::pin(SoloHost::new(SoloHostConfig {
         ctl_nats_url,
-        lattice: Arc::from(args.lattice),
+        domain: Arc::from(args.lattice),
         host_key,
         config_service_enabled: args.config_service_enabled,
         js_domain: args.js_domain,

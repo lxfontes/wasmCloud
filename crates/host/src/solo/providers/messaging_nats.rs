@@ -302,7 +302,7 @@ impl crate::solo::Host {
         let commands = ProviderCommandReceivers::new(
             Arc::clone(&self.rpc_nats),
             &quit_tx,
-            &self.host_config.lattice,
+            &self.host_config.domain,
             provider_id,
             provider_id,
             &host_id,
@@ -313,7 +313,7 @@ impl crate::solo::Host {
         let conn = ProviderConnection::new(
             Arc::clone(&self.rpc_nats),
             Arc::from(provider_id),
-            Arc::clone(&self.host_config.lattice),
+            Arc::clone(&self.host_config.domain),
             host_id.to_string(),
             host_data.config,
             provider_xkey,
@@ -326,7 +326,7 @@ impl crate::solo::Host {
             messaging_links: Arc::clone(&self.messaging_links),
             subscriptions: Mutex::default(),
             host_id: Arc::from(host_id),
-            lattice_id: Arc::clone(&self.host_config.lattice),
+            lattice_id: Arc::clone(&self.host_config.domain),
         };
         for ld in host_data.link_definitions {
             if let Err(e) = receive_link_for_provider(&provider, &conn, ld).await {

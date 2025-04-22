@@ -46,7 +46,7 @@ type LinkInstances = HashMap<Box<str>, HashMap<Box<str>, Box<str>>>;
 pub struct Handler {
     pub nats: Arc<async_nats::Client>,
     /// The WASI config for the component
-    pub wasi_config: Arc<RwLock<BTreeMap<String, String>>>,
+    pub wasi_config: Arc<RwLock<HashMap<String, String>>>,
     /// The lattice this handler will use for RPC
     pub lattice: Arc<String>,
     /// The identifier of the component that this handler is associated with

@@ -1,5 +1,6 @@
 use anyhow::Context as _;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
+use wasmcloud_core::InterfaceLinkDefinition;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -84,27 +85,66 @@ where
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize, Hash)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct LinkTarget {
+    #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) namespace: String,
+    #[serde(default)]
+    pub(crate) capability: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct Link {
-    /// Target for the link, which can be a unique identifier or (future) a routing group
-    #[serde(default)]
-    pub(crate) target: String,
-    /// Name of the link. Not providing this is equivalent to specifying "default"
     #[serde(default = "default_link_name")]
     pub(crate) name: String,
-    /// WIT namespace of the link operation, e.g. `wasi` in `wasi:keyvalue/readwrite.get`
+    #[serde(default)]
+    pub(crate) target: LinkTarget,
     #[serde(default)]
     pub(crate) wit_namespace: String,
-    /// WIT package of the link operation, e.g. `keyvalue` in `wasi:keyvalue/readwrite.get`
     #[serde(default)]
     pub(crate) wit_package: String,
-    /// WIT Interfaces to be used for the link, e.g. `readwrite`, `atomic`, etc.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) interfaces: Vec<String>,
-    /// List of named configurations to provide to the target upon request
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) config: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub(crate) config: HashMap<String, String>,
+}
+
+impl Link {
+    pub fn as_import(
+        &self,
+        source_namespace: String,
+        source_name: String,
+        source_is_capability: bool,
+    ) -> InterfaceLinkDefinition {
+        let target = if self.target.capability {
+            format!("capability.{}.{}", self.target.namespace, self.target.name)
+        } else {
+            format!("component.{}.{}", self.target.namespace, self.target.name)
+        };
+
+        let source_id = if source_is_capability {
+            format!("capability.{}.{}", source_namespace, source_name)
+        } else {
+            format!("component.{}.{}", source_namespace, source_name)
+        };
+
+        InterfaceLinkDefinition {
+            name: self.name.clone(),
+            wit_namespace: self.wit_namespace.clone(),
+            wit_package: self.wit_package.clone(),
+            interfaces: self.interfaces.clone(),
+            source_id,
+            target,
+            source_config: Default::default(),
+            target_config: self.config.clone(),
+            source_secrets: Default::default(),
+            target_secrets: Default::default(),
+        }
+    }
 }
 
 fn default_link_name() -> String {
@@ -118,8 +158,8 @@ pub struct Capability {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) uri: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) config: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub(crate) config: HashMap<String, String>,
 }
 
 /// Command a host to scale a component
@@ -133,17 +173,19 @@ pub struct StartComponentRequest {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) image: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) annotations: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub(crate) annotations: HashMap<String, String>,
     #[serde(default)]
     pub(crate) concurrency: u32,
 
     // Runtime Configuration
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) wasi_config: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub(crate) wasi_config: HashMap<String, String>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) links: Vec<Link>,
+    pub(crate) imports: Vec<Link>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) exports: Vec<Link>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -176,11 +218,14 @@ pub struct StartProviderRequest {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) image: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) annotations: Option<BTreeMap<String, String>>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) config: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub(crate) annotations: HashMap<String, String>,
+    #[serde(default)]
+    pub(crate) config: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) imports: Vec<Link>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) exports: Vec<Link>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
